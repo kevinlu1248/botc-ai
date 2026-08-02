@@ -1,0 +1,11 @@
+# Vision sidecar (same stack as botcirl). Prefer the linked venv:
+#   ln -sfn /path/to/botcirl/.venv vision/.venv
+# or:
+#   python3.13 -m venv vision/.venv && vision/.venv/bin/pip install -r vision/requirements.txt
+
+ultralytics>=8.4
+lap>=0.5
+insightface>=1.0
+onnxruntime>=1.28
+opencv-python>=4.10
+numpy>=2.0

@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Downloaded model weights
+*.pt
+data/models/
+
+# Face gallery and event log: real people's biometric data. Never commit this.
+data/gallery/
+data/events.jsonl
+data/floor_homography.npy
+
+# Voice biometrics and recorded speech. Never commit.
+data/voices/
+data/voice_calib/
+data/speech/
+data/voice_face_links.json
+data/sessions/

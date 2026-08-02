@@ -1,0 +1,18 @@
+# Verified working together on macOS 15 / Apple silicon / Python 3.13.
+# Lower bounds rather than pins - nothing here is version-fragile in practice.
+
+ultralytics>=8.4          # YOLO11 person detection + ByteTrack. NOTE: AGPL-3.0.
+lap>=0.5                  # assignment solver ByteTrack needs
+insightface>=1.0          # SCRFD face detection + ArcFace embeddings
+onnxruntime>=1.28         # runs the insightface models; CoreML EP on Apple silicon
+opencv-python>=4.10
+numpy>=2.0
+
+# audio
+sounddevice>=0.5          # mic capture (bundles PortAudio on macOS)
+silero-vad>=6.0           # voice activity detection, tiny and torch-based
+speechbrain>=1.0          # ECAPA-TDNN speaker embeddings
+soundfile>=0.13           # writing debug wavs
+
+# tests
+pytest>=8.0

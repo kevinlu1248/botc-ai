@@ -1,0 +1,12 @@
+node_modules/
+.env
+recordings/
+vision/data/
+vision/.venv
+vision/**/__pycache__/
+vision/**/.pytest_cache/
+vision/botcirl-src/*.pt
+vision/botcirl-src/**/__pycache__/
+.DS_Store
+*.pyc
+.venv/
