@@ -104,8 +104,8 @@ export function looksUnfinished(text) {
   const words = t.replace(/[.?!…,]+$/g, "").split(/\s+/).filter(Boolean);
   // One short token is rarely a finished request ("Read", "Need").
   if (words.length === 1 && words[0].length <= 14) return true;
-  // "Okay so" / "I need" / "let's say" without a finish.
-  if (words.length <= 4 && OPENER.test(t) && !/[.?!]$/.test(t)) return true;
+  // Very short openers only ("Okay so", "I need") — not "tell me a joke".
+  if (words.length <= 2 && OPENER.test(t) && !/[.?!]$/.test(t)) return true;
   return false;
 }
 
