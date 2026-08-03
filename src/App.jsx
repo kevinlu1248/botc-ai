@@ -84,8 +84,11 @@ export default function App() {
   const send = useCallback(
     async (text, meta = {}) => {
       if (!text.trim()) return;
-      // Any user text (typed or voice) cuts the assistant off immediately.
+      // Cut off any previous reply (history truncation), then re-arm TTS so this
+      // turn's streamed deltas are spoken. stopTurn alone leaves stopped=true,
+      // which silently drops every feed() for the new reply.
       interruptRef.current?.();
+      tts.cancel();
 
       if (busyRef.current) {
         queueRef.current.push({ text, meta }); // spoken mid-turn — answer it next, don't drop it

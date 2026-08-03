@@ -63,12 +63,18 @@ class FaceConfig:
     enroll_threshold: float | None = None
     # Embeddings kept per identity. More angles/lighting = more robust matching.
     embeddings_per_identity: int = 12
-    # Head-toward-camera (landmark yaw proxy, not true eye gaze). Frontal score
-    # above this counts as looking; debounced so a single blurry frame does not
-    # flip the flag.
-    looking_threshold: float = 0.55
-    looking_hold_s: float = 0.35
-    looking_release_s: float = 0.7
+    # Head-toward-camera (landmark yaw proxy, not true eye gaze).
+    # Hysteresis: easier to *stay* looking than to *enter*, so the flag does not
+    # flicker when the nose landmark jitters around the threshold.
+    looking_enter: float = 0.42
+    looking_exit: float = 0.28
+    looking_hold_s: float = 0.2
+    looking_release_s: float = 1.4
+    # Keep "looking" sticky this long after the last good frontal face, so a
+    # missed face frame mid-sentence does not drop the STT gate.
+    looking_sticky_s: float = 2.0
+    # Back-compat alias used by older code paths.
+    looking_threshold: float = 0.42
 
 
 @dataclass

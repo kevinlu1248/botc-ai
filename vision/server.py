@@ -64,11 +64,18 @@ class VisionRuntime:
         cfg.audio.enabled = False  # botc-ai owns the mic / STT path
         cfg.camera.flip = True
         # Prefer low latency over resolution — 640×360 is enough for looking + ID.
-        cfg.camera.width = int(os.environ.get("VISION_WIDTH", "640"))
-        cfg.camera.height = int(os.environ.get("VISION_HEIGHT", "360"))
-        cfg.person.imgsz = int(os.environ.get("VISION_IMGSZ", "416"))
-        cfg.face.every_n_frames = int(os.environ.get("VISION_FACE_EVERY", "3"))
-        cfg.face.det_size = int(os.environ.get("VISION_FACE_DET", "320"))
+        # 960×540: better close-up faces than 360p, still light enough for low lag.
+        cfg.camera.width = int(os.environ.get("VISION_WIDTH", "960"))
+        cfg.camera.height = int(os.environ.get("VISION_HEIGHT", "540"))
+        cfg.person.imgsz = int(os.environ.get("VISION_IMGSZ", "480"))
+        cfg.face.every_n_frames = int(os.environ.get("VISION_FACE_EVERY", "2"))
+        cfg.face.det_size = int(os.environ.get("VISION_FACE_DET", "480"))
+        cfg.face.min_face_px = int(os.environ.get("VISION_MIN_FACE", "28"))
+        cfg.face.looking_enter = float(os.environ.get("VISION_LOOK_ENTER", "0.38"))
+        cfg.face.looking_exit = float(os.environ.get("VISION_LOOK_EXIT", "0.22"))
+        cfg.face.looking_hold_s = float(os.environ.get("VISION_LOOK_HOLD", "0.15"))
+        cfg.face.looking_release_s = float(os.environ.get("VISION_LOOK_RELEASE", "1.6"))
+        cfg.face.looking_sticky_s = float(os.environ.get("VISION_LOOK_STICKY", "2.5"))
         # Prefer a local weight file if present; else let Ultralytics download
         # yolo11n-pose.pt on first run.
         pose = SRC / "yolo11n-pose.pt"

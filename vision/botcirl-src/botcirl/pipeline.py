@@ -51,10 +51,12 @@ class PersonTrack:
 
     # Head toward camera (landmark yaw). Not true eye gaze.
     looking: bool = False
-    looking_score: float = 0.0  # latest frontal 0..1
+    looking_score: float = 0.0  # smoothed frontal 0..1
     looking_since: float | None = None
+    looking_last_good: float | None = None  # last time score cleared enter threshold
     _looking_seen_at: float | None = None
     _looking_lost_at: float | None = None
+    _looking_ema: float = 0.0
 
     # Pose + gesture state
     kps: np.ndarray | None = None  # (17, 2) COCO keypoints, image pixels
@@ -443,28 +445,46 @@ class Pipeline:
         # that body's width. Those two checks cost nothing and throw out most of
         # the wrong answers.
         tcfg = self.cfg.track
+        frame_w = self.frame_size[0] if self.frame_size else 1280
         pairs: list[tuple[float, Face, PersonTrack]] = []
         for face in faces:
+            close_up = face.width / max(frame_w, 1) >= 0.22
             for trk in self.tracks.values():
                 if now - trk.last_seen > 0.5:
                     continue
                 c = _containment(face.bbox, trk.bbox)
-                if c < 0.6:
-                    continue
+                # Close-up: face often barely fits the body box (or the body is
+                # only a torso crop). Accept weaker containment.
+                if c < (0.25 if close_up else 0.6):
+                    # Also try: body centre near face centre (same person).
+                    if not close_up:
+                        continue
+                    tx = (trk.bbox[0] + trk.bbox[2]) / 2.0
+                    ty = (trk.bbox[1] + trk.bbox[3]) / 2.0
+                    if abs(tx - face.center[0]) > face.width * 1.2:
+                        continue
+                    if abs(ty - face.center[1]) > face.height * 2.0:
+                        continue
+                    c = max(c, 0.3)
                 x1, y1, x2, y2 = trk.bbox
                 bw, bh = max(x2 - x1, 1), max(y2 - y1, 1)
 
                 # Where down the body does the face sit? Heads are at the top.
                 depth = (face.center[1] - y1) / bh
-                if depth > tcfg.max_face_depth:
+                if not close_up and depth > tcfg.max_face_depth:
                     continue
                 # A head is roughly a fifth to a half of a visible body's width.
                 # Way outside that and this box belongs to somebody else.
+                # Close-up: face can be almost as wide as the body box.
                 ratio = face.width / bw
-                if not (tcfg.min_face_body_ratio <= ratio <= tcfg.max_face_body_ratio):
+                lo = tcfg.min_face_body_ratio
+                hi = 1.15 if close_up else tcfg.max_face_body_ratio
+                if not (lo <= ratio <= hi) and not close_up:
                     continue
 
-                score = c * (1.0 - depth) * min(bw / max(face.width, 1), 8.0) ** -0.25
+                score = c * (1.0 - min(depth, 1.0)) * min(bw / max(face.width, 1), 8.0) ** -0.25
+                if close_up:
+                    score += 0.5  # prefer binding large faces rather than dropping them
                 pairs.append((score, face, trk))
 
         # Greedy best-first, one face per body and one body per face, so two
@@ -477,6 +497,16 @@ class Pipeline:
             trk.face = face
             trk._face_t = now  # noqa: SLF001 - internal bookkeeping
 
+        # Orphan close-up faces: if only one announced track, hand it the face
+        # so looking still works when the body detector is a mess at short range.
+        unbound = [f for f in faces if id(f) not in taken_faces]
+        announced = [t for t in self.tracks.values() if t.announced and t.face is None]
+        if len(unbound) == 1 and len(announced) == 1:
+            face = unbound[0]
+            if face.width / max(frame_w, 1) >= 0.18:
+                announced[0].face = face
+                announced[0]._face_t = now  # noqa: SLF001
+
         for trk in self.tracks.values():
             if trk.face is not None:
                 self._vote(trk, trk.face, now)
@@ -485,14 +515,61 @@ class Pipeline:
         self._resolve_conflicts(now)
 
     def _update_looking(self, trk: PersonTrack, now: float) -> None:
-        """Debounced head-toward-camera flag from face landmarks."""
+        """Debounced + hysteresis head-toward-camera from face landmarks.
+
+        Face detection only runs every N frames, so a missing face this pass is
+        not "looked away" — we keep the EMA score and only release after
+        looking_release_s of consistently non-frontal evidence.
+
+        Close-up faces (filling much of the frame) are treated more leniently:
+        if a face is detected at all and reasonably large, that is strong
+        evidence the person is addressing the camera.
+        """
         fcfg = self.cfg.face
-        toward = False
-        score = 0.0
+        enter = float(getattr(fcfg, "looking_enter", fcfg.looking_threshold))
+        exit_thr = float(getattr(fcfg, "looking_exit", max(0.0, enter - 0.15)))
+
+        raw = None
         if trk.face is not None:
-            score = float(trk.face.frontal())
-            toward = score >= fcfg.looking_threshold
-        trk.looking_score = score
+            face = trk.face
+            if face.kps is not None:
+                raw = float(face.frontal())
+            else:
+                # No landmarks: a confident face is a weak "toward" prior.
+                raw = 0.6 if face.score >= fcfg.det_conf else 0.0
+            # Close-up boost: a large face almost always means addressing the cam.
+            if self.frame_size is not None:
+                fw = max(face.width, 1)
+                frame_w = max(self.frame_size[0], 1)
+                if fw / frame_w >= 0.22:
+                    raw = max(raw, 0.72)
+                if fw / frame_w >= 0.35:
+                    raw = max(raw, 0.85)
+
+        if raw is not None:
+            alpha = 0.35
+            trk._looking_ema = (1.0 - alpha) * float(trk._looking_ema) + alpha * raw
+            score = trk._looking_ema
+        else:
+            # No face this frame — hold the previous score (do not slam to 0).
+            score = float(trk._looking_ema) if trk._looking_ema > 0 else float(trk.looking_score)
+
+        trk.looking_score = float(score)
+
+        # Hysteresis: higher bar to enter looking, lower bar to leave.
+        sticky = float(getattr(fcfg, "looking_sticky_s", 2.0))
+        if trk.looking:
+            if raw is not None:
+                toward = score >= exit_thr
+            elif trk.looking_last_good is not None:
+                toward = (now - trk.looking_last_good) <= sticky
+            else:
+                toward = False
+        else:
+            toward = raw is not None and score >= enter
+
+        if toward and raw is not None and score >= enter:
+            trk.looking_last_good = now
 
         if toward:
             if trk._looking_seen_at is None:
@@ -511,7 +588,7 @@ class Pipeline:
                     )
             return
 
-        # Not frontal (or no face this pass).
+        # Not frontal enough.
         trk._looking_seen_at = None
         if not trk.looking:
             trk.looking_since = None
@@ -532,9 +609,23 @@ class Pipeline:
                     duration_s=round(max(held, 0.0), 2),
                 )
 
-    def looking_now(self) -> list[PersonTrack]:
-        """Everyone currently facing the camera."""
-        return [t for t in self.tracks.values() if t.looking and t.announced]
+    def looking_now(self, sticky: bool = True) -> list[PersonTrack]:
+        """Everyone facing the camera (optionally including sticky recent looks)."""
+        now = time.time()
+        sticky_s = float(getattr(self.cfg.face, "looking_sticky_s", 2.0))
+        out = []
+        for t in self.tracks.values():
+            if not t.announced:
+                continue
+            if t.looking:
+                out.append(t)
+            elif (
+                sticky
+                and t.looking_last_good is not None
+                and now - t.looking_last_good <= sticky_s
+            ):
+                out.append(t)
+        return out
 
     def _vote(self, trk: PersonTrack, face: Face, now: float) -> None:
         fcfg = self.cfg.face

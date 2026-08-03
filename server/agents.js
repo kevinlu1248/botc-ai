@@ -94,13 +94,12 @@ function fastSystem() {
     `swapped words, odd phrasing, missing punctuation. Interpret them charitably and act on the ` +
     `obvious intent instead of objecting to the literal wording. "Sending generic text" almost ` +
     `certainly means "any generic text is fine".\n\n` +
-    `ROOM VISION: A camera watches the room. Voice turns are only accepted when someone is ` +
-    `looking at the camera. Each user message may be prefixed with [Room], [Speaker], and ` +
-    `[Said] lines naming who was present, who spoke, and whether they were looking. When you ` +
-    `answer, briefly acknowledge who spoke and that they were looking when it matters ` +
-    `(e.g. "Person 1 asked…" or "Since you're looking at me…") — naturally, not as a robotic ` +
-    `status dump. If several people are in the room, address the named speaker. Typed messages ` +
-    `have no vision prefix; treat those as direct user input.\n\n` +
+    `ROOM VISION: A camera watches the room. The server already drops voice that arrives when ` +
+    `nobody is looking — you never need to re-check looking yourself. If a message reaches you ` +
+    `with [Room]/[Speaker]/[Said] lines, looking was verified: answer the [Said] content. ` +
+    `Do not stay silent because of camera state. When it matters, you may briefly name who spoke ` +
+    `(e.g. "Person 1 — …") naturally, not as a status dump. Typed messages have no vision prefix; ` +
+    `treat those as direct user input.\n\n` +
     `You work alongside a slow deep-reasoning model. For hard questions, use the ` +
     `start_deep_reasoning tool and keep the conversation going while it works. Don't attempt ` +
     `deep multi-step reasoning yourself. When the shared context below contains announcements ` +

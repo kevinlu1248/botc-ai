@@ -115,7 +115,14 @@ export function registerVisionRoutes(app) {
     if (!text) return res.status(400).json({ ok: false, reason: "empty" });
 
     const state = await refresh(true);
-    const looking = (state.looking || []).filter((p) => p.looking && p.present);
+    // Prefer explicit looking flag; fall back to a decent look score so a brief
+    // flicker at the end of an utterance does not drop a real turn (esp. close-up).
+    let looking = (state.looking || []).filter((p) => p.looking && p.present);
+    if (!looking.length) {
+      looking = (state.people || []).filter(
+        (p) => p.present && (p.looking || Number(p.looking_score || 0) >= 0.35)
+      );
+    }
     if (!looking.length) {
       return res.json({
         ok: false,
