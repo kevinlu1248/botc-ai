@@ -165,14 +165,19 @@ export default function App() {
                 next[next.length - 1] = { ...last, text: last.text + msg.text };
                 return next;
               });
+              // Spoken reply only — never feed thoughts (those are type "thought").
               tts.feed(msg.text);
             } else if (msg.type === "thought") {
+              // Private reasoning: UI only, never TTS.
               if (!streamLiveRef.current) continue;
               setTurns((t) => {
                 const next = [...t];
                 const last = next[next.length - 1];
                 if (last?.cutOff) return t;
-                next[next.length - 1] = { ...last, thought: (last.thought || "") + msg.text };
+                next[next.length - 1] = {
+                  ...last,
+                  thought: (last.thought || "") + msg.text,
+                };
                 return next;
               });
             } else if (msg.type === "job_started") {
@@ -182,6 +187,8 @@ export default function App() {
             }
           }
         }
+        // Only flush TTS if this turn produced spoken text. A think-and-stay-silent
+        // turn has empty buffer — flush would be a no-op, but be explicit.
         if (streamLiveRef.current) tts.flush();
       } catch (err) {
         pushToast(
@@ -244,14 +251,17 @@ export default function App() {
     onSpeechStart: () => interruptRef.current?.(),
   });
 
-  // Half-duplex: mute Deepgram while the assistant is speaking so playback
-  // isn't transcribed. Local VAD still watches the raw mic for barge-in.
+  // Half-duplex: while the assistant turn is in flight and speak-replies is on,
+  // mute Deepgram for the whole turn — not only while audio is audible. That
+  // stops (a) TTS echo and (b) accidental speech of "I'll stay quiet" reasoning
+  // from being re-transcribed as the next user message. Local VAD still does
+  // barge-in when playback is armed.
   useEffect(() => {
-    mic.setMuted(audible && !interrupted);
-  }, [audible, interrupted, mic.setMuted]);
+    const gate = voiceOut && busy && !interrupted;
+    mic.setMuted(gate || (audible && !interrupted));
+  }, [voiceOut, busy, audible, interrupted, mic.setMuted]);
 
-  // Arm barge-in as soon as TTS is active (fetching or playing). Waiting only
-  // for `audible` delayed interrupts until the first clip actually started.
+  // Arm barge-in as soon as TTS is active (fetching or playing).
   useEffect(() => {
     mic.setPlaying((speaking || audible) && !interrupted);
   }, [speaking, audible, interrupted, mic.setPlaying]);
@@ -344,15 +354,19 @@ export default function App() {
             )}
             {turns.map((turn, i) => {
               const isLast = i === turns.length - 1;
-              // While speaking, show the voiced prefix normally and the rest
-              // dimmed, so what you hear and what you read stay in step.
               const dim =
                 turn.role === "assistant" &&
                 isLast &&
                 spokenChars != null &&
                 spokenChars < turn.text.length;
+              const silent =
+                turn.role === "assistant" &&
+                !turn.text?.trim() &&
+                !!turn.thought &&
+                !(busy && isLast) &&
+                !turn.cutOff;
               return (
-                <div key={i} className={`turn ${turn.role}`}>
+                <div key={i} className={`turn ${turn.role}${silent ? " silent-turn" : ""}`}>
                   <span className="who">
                     {turn.role === "user"
                       ? turn.who
@@ -360,23 +374,26 @@ export default function App() {
                         : "You"
                       : "Assistant"}
                   </span>
-                  {turn.thought && <p className="thought">{turn.thought}</p>}
-                  <p>
-                    {dim ? (
-                      <>
-                        {turn.text.slice(0, spokenChars)}
-                        <span className="unspoken">{turn.text.slice(spokenChars)}</span>
-                      </>
-                    ) : (
-                      turn.text || (busy && isLast ? "…" : "")
-                    )}
-                    {turn.cutOff && <span className="cutoff"> interrupted</span>}
-                    {turn.role === "assistant" &&
-                      !turn.text &&
-                      turn.thought &&
-                      !busy &&
-                      !turn.cutOff && <span className="silent">stayed silent</span>}
-                  </p>
+                  {turn.thought && (
+                    <div className="thought-block">
+                      <span className="thought-label">Thinking</span>
+                      <p className="thought">{turn.thought}</p>
+                    </div>
+                  )}
+                  {(turn.text?.trim() || (busy && isLast && turn.role === "assistant") || turn.cutOff) && (
+                    <p className="speech">
+                      {dim ? (
+                        <>
+                          {turn.text.slice(0, spokenChars)}
+                          <span className="unspoken">{turn.text.slice(spokenChars)}</span>
+                        </>
+                      ) : (
+                        turn.text || (busy && isLast ? "…" : "")
+                      )}
+                      {turn.cutOff && <span className="cutoff"> interrupted</span>}
+                    </p>
+                  )}
+                  {silent && <span className="silent">stayed silent</span>}
                 </div>
               );
             })}
