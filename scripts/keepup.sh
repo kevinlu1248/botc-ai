@@ -20,8 +20,8 @@ mkdir -p "$RUN" "$LOG"
 export PATH="${ROOT}/vision/.venv/bin:${HOME}/.nvm/versions/node/v22.22.0/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 services=(
-  # name|port|health_url|start_cmd
-  "vision|8766|http://127.0.0.1:8766/api/state|VISION_FACE_BACKEND=opencv \"${ROOT}/vision/.venv/bin/python\" \"${ROOT}/vision/server.py\""
+  # name|port|health_url|start_cmd  (env VAR=val prefix is supported)
+  "vision|8766|http://127.0.0.1:8766/api/state|env VISION_FACE_BACKEND=opencv \"${ROOT}/vision/.venv/bin/python\" \"${ROOT}/vision/server.py\""
   "api|3001|http://127.0.0.1:3001/api/state|node \"${ROOT}/server/index.js\""
   "ui|5181|http://127.0.0.1:5181/|npx --yes vite --port 5181 --host 127.0.0.1 --strictPort"
 )
