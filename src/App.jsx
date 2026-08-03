@@ -37,6 +37,10 @@ export default function App() {
   const queueRef = useRef([]);
   const sendRef = useRef(null);
   const interruptRef = useRef(null);
+  // False once the user barges in: stop appending model deltas to the UI /
+  // TTS. The HTTP stream is still drained so the server can finish the turn
+  // and apply pendingTruncation to the right assistant message.
+  const streamLiveRef = useRef(true);
   const transcriptRef = useRef(null);
   const toastId = useRef(0);
 
@@ -56,28 +60,40 @@ export default function App() {
     [dismissToast]
   );
 
-  // Barge-in only: stop playback mid-reply and trim history to what was heard.
-  // Do NOT call this at the start of a normal send — stopTurn leaves TTS in
-  // stopped=true, which drops every feed() for the new streamed reply.
+  // Barge-in only (while audio is playing). Trims UI + server history to what
+  // was actually heard. Do NOT call at the start of a normal send — that left
+  // TTS stopped=true and dropped the whole next reply.
   const interrupt = useCallback(() => {
+    if (!streamLiveRef.current) return; // already cut this stream
+    streamLiveRef.current = false;
+
     const cut = tts.stopTurn();
     setInterrupted(true);
 
-    // Nothing was actually mid-speech (empty turn, or already finished).
-    if (!cut?.full || cut.index <= 0) return;
-    if (cut.index >= cut.full.length) return; // fully spoken already
+    const spoken = cut?.spoken ?? "";
+    const index = cut?.index ?? 0;
 
-    setSpokenChars(cut.index);
+    // Freeze the on-screen transcript to what was heard — not the full draft.
+    setSpokenChars(index);
     setTurns((t) => {
       const next = [...t];
       const last = next[next.length - 1];
-      if (last?.role === "assistant") next[next.length - 1] = { ...last, cutOff: true };
+      if (last?.role === "assistant") {
+        next[next.length - 1] = {
+          ...last,
+          text: spoken || (index > 0 ? last.text.slice(0, index) : last.text),
+          cutOff: true,
+        };
+      }
       return next;
     });
+
+    // Always notify the server so model history is truncated when the stream
+    // finishes (pendingTruncation), even if index is 0.
     fetch("/api/interrupted", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ spoken: cut.spoken }),
+      body: JSON.stringify({ spoken }),
     }).catch(() => {});
   }, [tts]);
   interruptRef.current = interrupt;
@@ -85,19 +101,19 @@ export default function App() {
   const send = useCallback(
     async (text, meta = {}) => {
       if (!text.trim()) return;
-      // Clear any queued audio from a previous turn and re-arm streaming TTS.
-      // (Barge-in already called stopTurn if the user talked over playback.)
+      // Re-arm streaming TTS for this turn. (Barge-in already stopTurn'd if needed.)
       tts.cancel();
 
       if (busyRef.current) {
-        queueRef.current.push({ text, meta }); // spoken mid-turn — answer it next, don't drop it
+        queueRef.current.push({ text, meta });
         return;
       }
       busyRef.current = true;
       setBusy(true);
       setInterrupted(false);
       setSpokenChars(null);
-      // What the user sees in the transcript (short); what the model sees may be enriched.
+      streamLiveRef.current = true;
+
       const display = meta.displayText || text;
       const modelText = meta.modelText || text;
       setTurns((t) => [
@@ -123,6 +139,8 @@ export default function App() {
         const decoder = new TextDecoder();
         let buffer = "";
 
+        // Always drain the stream so the server can complete and apply
+        // pendingTruncation to the assistant message it just pushed.
         while (true) {
           const { value, done } = await reader.read();
           if (done) break;
@@ -132,20 +150,28 @@ export default function App() {
           buffer = lines.pop() ?? "";
           for (const line of lines) {
             if (!line.trim()) continue;
-            const msg = JSON.parse(line);
+            let msg;
+            try {
+              msg = JSON.parse(line);
+            } catch {
+              continue;
+            }
             if (msg.type === "delta") {
+              if (!streamLiveRef.current) continue; // barge-in: freeze UI + TTS
               setTurns((t) => {
                 const next = [...t];
                 const last = next[next.length - 1];
+                if (last?.cutOff) return t;
                 next[next.length - 1] = { ...last, text: last.text + msg.text };
                 return next;
               });
               tts.feed(msg.text);
             } else if (msg.type === "thought") {
-              // Private reasoning: shown on screen, never sent to text-to-speech.
+              if (!streamLiveRef.current) continue;
               setTurns((t) => {
                 const next = [...t];
                 const last = next[next.length - 1];
+                if (last?.cutOff) return t;
                 next[next.length - 1] = { ...last, thought: (last.thought || "") + msg.text };
                 return next;
               });
@@ -156,10 +182,8 @@ export default function App() {
             }
           }
         }
-        tts.flush();
+        if (streamLiveRef.current) tts.flush();
       } catch (err) {
-        // A bare fetch rejection surfaces as "Failed to fetch", which tells the
-        // user nothing — name the likely cause instead.
         pushToast(
           err instanceof TypeError
             ? "Can't reach the API server. Is it running on port 3001? (npm run server)"
@@ -220,18 +244,17 @@ export default function App() {
     onSpeechStart: () => interruptRef.current?.(),
   });
 
-  // Half-duplex gate, scoped to *audible* playback only. Gating on `busy` as
-  // well meant anything said while the model was thinking got thrown away —
-  // there is no echo to guard against when nothing is playing.
+  // Half-duplex: mute Deepgram while the assistant is speaking so playback
+  // isn't transcribed. Local VAD still watches the raw mic for barge-in.
   useEffect(() => {
     mic.setMuted(audible && !interrupted);
   }, [audible, interrupted, mic.setMuted]);
 
-  // Only allow barge-in while sound is genuinely coming out — there's nothing to
-  // interrupt while the model is thinking or a clip is still being synthesised.
+  // Arm barge-in as soon as TTS is active (fetching or playing). Waiting only
+  // for `audible` delayed interrupts until the first clip actually started.
   useEffect(() => {
-    mic.setPlaying(audible && !interrupted);
-  }, [audible, interrupted, mic.setPlaying]);
+    mic.setPlaying((speaking || audible) && !interrupted);
+  }, [speaking, audible, interrupted, mic.setPlaying]);
 
   useEffect(() => {
     if (mic.error) pushToast(mic.error);

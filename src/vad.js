@@ -22,14 +22,15 @@
 // consecutive frames must clear them before it counts as barge-in.
 
 export const VAD = {
-  // Loudness is the only thing that separates "talking to the assistant" from a
-  // conversation across the room, so it stays — measured ambient in this room
-  // peaks near 0.045, hence the headroom. It is no longer the *only* test.
-  RMS_MIN: 0.06,
-  SPEECH_RATIO_MIN: 0.5, // at least half the energy in the voice band
-  FLATNESS_MAX: 0.3, // reject noise-like (flat) spectra: clatter, hiss, impulses
-  DOMINANCE_MAX: 0.6, // reject single-tone sources: beeps, alarms, feedback
-  FRAMES: 9, // ~150ms sustained at 60fps
+  // Loudness separates "talking to the assistant" from a conversation across
+  // the room. Slightly lower than before so barge-in feels snappier; spectral
+  // gates still reject slams/clatter.
+  RMS_MIN: 0.05,
+  SPEECH_RATIO_MIN: 0.45,
+  FLATNESS_MAX: 0.35,
+  DOMINANCE_MAX: 0.65,
+  // ~50ms at 60fps — was 9 frames (~150ms) and felt sluggish.
+  FRAMES: 3,
 };
 
 const SPEECH_LO = 300;

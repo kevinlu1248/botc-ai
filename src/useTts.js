@@ -243,8 +243,28 @@ export function useTts(enabled, { onSpeakingChange, onAudibleChange } = {}) {
   // of this turn's text — otherwise later chunks would start speaking again.
   const stopTurn = useCallback(() => {
     const r = refs.current;
-    const index = progress();
-    const cut = { index, spoken: r.raw.slice(0, index), full: r.raw };
+    // Capture before reset wipes the clock / clip list.
+    let index = progress();
+    const full = r.raw;
+    // If audio was scheduled but the clock hasn't advanced into a clip yet
+    // (first ~20ms of a chunk), credit at least the start of the current buffer
+    // rather than reporting 0 and leaving the full reply in history.
+    if (index <= 0 && r.clips.length > 0 && full) {
+      const first = r.clips.find((c) => !c.standalone);
+      if (first && r.ctx && r.ctx.currentTime + 0.05 >= first.startAt) {
+        index = Math.min(full.length, Math.max(index, first.rawStart + 1));
+      }
+    }
+    // Snap to a word boundary so truncation doesn't leave a half-word.
+    let spoken = full.slice(0, index);
+    if (index > 0 && index < full.length && !/\s/.test(full[index])) {
+      const sp = spoken.lastIndexOf(" ");
+      if (sp > 0) {
+        index = sp + 1;
+        spoken = full.slice(0, index);
+      }
+    }
+    const cut = { index, spoken, full };
     reset();
     r.stopped = true;
     return cut;
