@@ -22,16 +22,20 @@
 // far better UX than lagging half a second after the user starts talking.
 
 export const VAD = {
-  // Soft path: a couple of consecutive frames.
-  RMS_MIN: 0.035,
-  SPEECH_RATIO_MIN: 0.32,
-  FLATNESS_MAX: 0.5,
-  DOMINANCE_MAX: 0.75,
-  FRAMES: 2, // ~32ms at 60fps
-  // Hard path: one frame of clearly-voice energy → interrupt immediately.
-  HARD_RMS: 0.055,
-  HARD_SPEECH_RATIO: 0.38,
-  HARD_FLATNESS_MAX: 0.45,
+  // Soft path: one consecutive speech-like frame is enough.
+  RMS_MIN: 0.028,
+  SPEECH_RATIO_MIN: 0.28,
+  FLATNESS_MAX: 0.55,
+  DOMINANCE_MAX: 0.8,
+  FRAMES: 1,
+  // Hard path: loud energy → interrupt on the first sample (AEC can dull speech
+  // features, so pure loudness still counts while the assistant is talking).
+  HARD_RMS: 0.04,
+  HARD_SPEECH_RATIO: 0.25,
+  HARD_FLATNESS_MAX: 0.6,
+  // Ultra path: just loud — user said "stop" four times because spectral gates
+  // rejected near-field speech under echo cancellation.
+  LOUD_RMS: 0.07,
 };
 
 const SPEECH_LO = 300;
@@ -88,8 +92,9 @@ export function isSpeechFrame({ rms, speechRatio, flatness, dominance }) {
   );
 }
 
-/** Instant barge-in: one strong speech-like frame. */
+/** Instant barge-in: loud energy and/or speech-like spectrum. */
 export function isHardBargeIn({ rms, speechRatio, flatness }) {
+  if (rms >= VAD.LOUD_RMS) return true; // just yell / "STOP"
   return (
     rms >= VAD.HARD_RMS &&
     speechRatio >= VAD.HARD_SPEECH_RATIO &&

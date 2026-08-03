@@ -59,17 +59,15 @@ const ms = (name, fallback) => {
   return Number.isFinite(v) && v > 0 ? Math.round(v) : fallback;
 };
 
-// How long you may pause before the turn is considered over. 1000ms trades a
-// little snappiness for accuracy: short endpointing fragments speech into more
-// segments, and each segment gives Deepgram's language model less context, so
-// errors cluster around pauses. Deepgram's own example value of 300ms cuts
-// people off mid-sentence constantly.
-const ENDPOINTING_MS = ms("STT_ENDPOINTING_MS", 1000);
+// How long you may pause before the turn is considered over.
+// Defaults are snappy for voice chat; raise via env if you get cut off mid-thought.
+// Deepgram utterance_end_ms minimum is 1000.
+const ENDPOINTING_MS = ms("STT_ENDPOINTING_MS", 450);
 const UTTERANCE_END_MS = Math.max(1000, ms("STT_UTTERANCE_END_MS", 1000));
-// Extra beat granted only when the transcript trails off mid-thought.
-const CONTINUATION_GRACE_MS = ms("STT_CONTINUATION_GRACE_MS", 900);
-// Backstop for when Deepgram reports no boundary at all.
-const IDLE_FLUSH_MS = ms("STT_IDLE_FLUSH_MS", 2500);
+// Extra beat only when the transcript trails off mid-thought ("…and then").
+const CONTINUATION_GRACE_MS = ms("STT_CONTINUATION_GRACE_MS", 350);
+// Backstop when Deepgram reports no boundary at all.
+const IDLE_FLUSH_MS = ms("STT_IDLE_FLUSH_MS", 1100);
 
 // Words that essentially never end a sentence. If speech stops right after one,
 // the speaker is pausing to think, not finished — "come up with a hard math

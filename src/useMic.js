@@ -204,11 +204,11 @@ export function useMic({ onFinal, onSpeechStart }) {
             setPartial("");
             if (!gated && msg.text.trim()) onFinalRef.current?.(msg.text.trim());
           } else if (msg.type === "speech_started") {
-            // Only barge-in while the assistant is *audibly* playing. During
-            // thinking / TTS fetch the mic is unmuted; treating room noise or
-            // residual VAD as speech_started was cutting off every new reply
-            // (stopped=true → feed() drops → "interrupted" with no audio).
-            if (refs.current.playing && !refs.current.muted) {
+            // Barge-in while the assistant is armed (TTS fetching or playing).
+            // Audio still streams to Deepgram while "muted" — muted only drops
+            // partials/finals so TTS isn't transcribed. speech_started must
+            // still fire when muted, or "stop" never cuts the assistant.
+            if (refs.current.playing) {
               onSpeechStartRef.current?.();
             }
           } else if (msg.type === "ready") {
@@ -374,27 +374,27 @@ export function useMic({ onFinal, onSpeechStart }) {
       }
 
       const features = frameFeatures(buf, power, analyser.context.sampleRate, analyser.fftSize);
-      // Hard path: one strong frame → cut immediately (~0–16ms).
+      // Hard / loud path: cut immediately.
       if (isHardBargeIn(features)) {
         hits = 0;
         fired = true;
         onSpeechStartRef.current?.();
         return;
       }
-      // Soft path: two consecutive speech-like frames.
+      // Soft path: speech-like frames (default 1).
       if (isSpeechFrame(features)) {
         if (++hits >= VAD.FRAMES) {
           hits = 0;
           fired = true;
           onSpeechStartRef.current?.();
         }
-      } else if (hits > 0) {
-        hits = 0; // require consecutive, don't slowly decay
+      } else {
+        hits = 0;
       }
     };
 
-    // ~8ms polling while armed — much snappier than rAF alone under load.
-    const id = setInterval(tick, 8);
+    // ~6ms while armed.
+    const id = setInterval(tick, 6);
     return () => clearInterval(id);
   }, [capturing]);
 
