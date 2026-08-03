@@ -56,15 +56,17 @@ export default function App() {
     [dismissToast]
   );
 
+  // Barge-in only: stop playback mid-reply and trim history to what was heard.
+  // Do NOT call this at the start of a normal send — stopTurn leaves TTS in
+  // stopped=true, which drops every feed() for the new streamed reply.
   const interrupt = useCallback(() => {
-    // stopTurn reports how far playback actually got, from the audio clock and
-    // the character timestamps of each clip.
     const cut = tts.stopTurn();
-    setInterrupted(true); // lift the mic gate even if text is still streaming
+    setInterrupted(true);
 
-    if (!cut || !cut.full) return;
-    // Freeze the cursor rather than deleting text: the spoken part stays as it
-    // was and the unheard remainder is dimmed, so nothing vanishes from view.
+    // Nothing was actually mid-speech (empty turn, or already finished).
+    if (!cut?.full || cut.index <= 0) return;
+    if (cut.index >= cut.full.length) return; // fully spoken already
+
     setSpokenChars(cut.index);
     setTurns((t) => {
       const next = [...t];
@@ -72,7 +74,6 @@ export default function App() {
       if (last?.role === "assistant") next[next.length - 1] = { ...last, cutOff: true };
       return next;
     });
-    // The server still gets only what was heard, so the model's history matches.
     fetch("/api/interrupted", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -84,10 +85,8 @@ export default function App() {
   const send = useCallback(
     async (text, meta = {}) => {
       if (!text.trim()) return;
-      // Cut off any previous reply (history truncation), then re-arm TTS so this
-      // turn's streamed deltas are spoken. stopTurn alone leaves stopped=true,
-      // which silently drops every feed() for the new reply.
-      interruptRef.current?.();
+      // Clear any queued audio from a previous turn and re-arm streaming TTS.
+      // (Barge-in already called stopTurn if the user talked over playback.)
       tts.cancel();
 
       if (busyRef.current) {
@@ -185,8 +184,8 @@ export default function App() {
     async (raw) => {
       const text = (raw || "").trim();
       if (!text) return;
-      // Any recognized text interrupts, even if we later drop the turn.
-      interruptRef.current?.();
+      // Do not interrupt here: a rejected (not looking) transcript must not
+      // kill a playing reply. Barge-in is handled by onSpeechStart while audible.
       try {
         const res = await fetch("/api/vision/gate", {
           method: "POST",
@@ -217,7 +216,7 @@ export default function App() {
 
   const mic = useMic({
     onFinal: onVoiceFinal,
-    // Any speech activity interrupts TTS (not only finals).
+    // Only while the assistant is actually playing audio (useMic also gates this).
     onSpeechStart: () => interruptRef.current?.(),
   });
 
@@ -418,8 +417,8 @@ export default function App() {
             <form
               onSubmit={(e) => {
                 e.preventDefault();
-                // Typed text always interrupts and always submits (no looking gate).
-                interrupt();
+                // Typed text always submits (no looking gate). send() re-arms TTS.
+                if (audible) interrupt();
                 send(typed, { displayText: typed, modelText: typed });
                 setTyped("");
               }}
@@ -428,15 +427,14 @@ export default function App() {
                 value={typed}
                 onChange={(e) => {
                   const v = e.target.value;
-                  // Any keystroke of text interrupts the assistant.
-                  if (v && !typed) interrupt();
-                  else if (v.length > typed.length) interrupt();
+                  // Keystrokes only barge-in while the assistant is speaking.
+                  if (audible && v.length > typed.length) interrupt();
                   setTyped(v);
                 }}
                 placeholder={
                   mic.listening
-                    ? "Listening (look at camera) — or type to interrupt"
-                    : "Type a message (interrupts speech)"
+                    ? "Listening (look at camera) — or type anytime"
+                    : "Type a message"
                 }
               />
               <button type="submit" disabled={!typed.trim()}>

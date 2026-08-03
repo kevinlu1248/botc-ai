@@ -204,9 +204,13 @@ export function useMic({ onFinal, onSpeechStart }) {
             setPartial("");
             if (!gated && msg.text.trim()) onFinalRef.current?.(msg.text.trim());
           } else if (msg.type === "speech_started") {
-            // Ignore while muted — that's our own playback leaking in, and
-            // treating it as barge-in makes the assistant cut itself off.
-            if (!refs.current.muted) onSpeechStartRef.current?.();
+            // Only barge-in while the assistant is *audibly* playing. During
+            // thinking / TTS fetch the mic is unmuted; treating room noise or
+            // residual VAD as speech_started was cutting off every new reply
+            // (stopped=true → feed() drops → "interrupted" with no audio).
+            if (refs.current.playing && !refs.current.muted) {
+              onSpeechStartRef.current?.();
+            }
           } else if (msg.type === "ready") {
             setState("live");
           } else if (msg.type === "error") {
