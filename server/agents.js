@@ -11,6 +11,12 @@ export const MODELS = { fast: FAST_MODEL, slow: SLOW_MODEL };
 // The user talked over the assistant, so most of the last reply was never heard.
 // Rewrite it to what actually reached them — otherwise the model carries on
 // believing it said things the user has no knowledge of, and refers back to them.
+//
+// CRITICAL with extended thinking: Anthropic rejects any partial edit to an
+// assistant message that still contains `thinking` / `redacted_thinking` blocks
+// ("cannot be modified"). On interrupt we replace the *entire* content with
+// plain text (dropping thinking). That turn's private reasoning is abandoned;
+// only what was spoken stays in the transcript.
 export function truncateLastReply(spoken) {
   for (let i = shared.history.length - 1; i >= 0; i--) {
     const msg = shared.history[i];
@@ -21,14 +27,31 @@ export function truncateLastReply(spoken) {
       ? `${said} —[interrupted by the user here; they did not hear the rest]`
       : "[interrupted by the user before this could be spoken]";
 
+    const blocks = Array.isArray(msg.content) ? msg.content : null;
+    const hasThinking =
+      blocks?.some((b) => b.type === "thinking" || b.type === "redacted_thinking") ??
+      false;
+    const toolUses = blocks?.filter((b) => b.type === "tool_use") ?? [];
+
+    if (hasThinking) {
+      // Cannot keep thinking blocks while rewriting text — API will 400.
+      // If there were tool_use blocks, keep those objects byte-identical and
+      // only supply a fresh text block (no thinking).
+      if (toolUses.length) {
+        msg.content = [{ type: "text", text: note }, ...toolUses];
+      } else {
+        msg.content = note;
+      }
+      return { truncated: true, text: note };
+    }
+
     if (typeof msg.content === "string") {
       msg.content = note;
-    } else if (Array.isArray(msg.content)) {
+    } else if (blocks) {
       let replaced = false;
-      // Keep tool_use blocks intact; only the spoken text is rewritten.
-      msg.content = msg.content.filter((block) => {
+      msg.content = blocks.filter((block) => {
         if (block.type !== "text") return true;
-        if (replaced) return false; // collapse multiple text blocks into one
+        if (replaced) return false;
         block.text = note;
         replaced = true;
         return true;
