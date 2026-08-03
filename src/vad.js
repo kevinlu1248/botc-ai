@@ -18,19 +18,20 @@
 //                 them apart — measured 0.0000 for a 1kHz tone vs 0.0005 for
 //                 voiced speech.)
 //
-// No single feature suffices, so a frame must clear all four, and enough
-// consecutive frames must clear them before it counts as barge-in.
+// Barge-in is intentionally aggressive: cutting the assistant a bit early is
+// far better UX than lagging half a second after the user starts talking.
 
 export const VAD = {
-  // Loudness separates "talking to the assistant" from a conversation across
-  // the room. Slightly lower than before so barge-in feels snappier; spectral
-  // gates still reject slams/clatter.
-  RMS_MIN: 0.05,
-  SPEECH_RATIO_MIN: 0.45,
-  FLATNESS_MAX: 0.35,
-  DOMINANCE_MAX: 0.65,
-  // ~50ms at 60fps — was 9 frames (~150ms) and felt sluggish.
-  FRAMES: 3,
+  // Soft path: a couple of consecutive frames.
+  RMS_MIN: 0.035,
+  SPEECH_RATIO_MIN: 0.32,
+  FLATNESS_MAX: 0.5,
+  DOMINANCE_MAX: 0.75,
+  FRAMES: 2, // ~32ms at 60fps
+  // Hard path: one frame of clearly-voice energy → interrupt immediately.
+  HARD_RMS: 0.055,
+  HARD_SPEECH_RATIO: 0.38,
+  HARD_FLATNESS_MAX: 0.45,
 };
 
 const SPEECH_LO = 300;
@@ -84,5 +85,14 @@ export function isSpeechFrame({ rms, speechRatio, flatness, dominance }) {
     speechRatio >= VAD.SPEECH_RATIO_MIN &&
     flatness <= VAD.FLATNESS_MAX &&
     dominance <= VAD.DOMINANCE_MAX
+  );
+}
+
+/** Instant barge-in: one strong speech-like frame. */
+export function isHardBargeIn({ rms, speechRatio, flatness }) {
+  return (
+    rms >= VAD.HARD_RMS &&
+    speechRatio >= VAD.HARD_SPEECH_RATIO &&
+    flatness <= VAD.HARD_FLATNESS_MAX
   );
 }

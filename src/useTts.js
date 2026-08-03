@@ -25,7 +25,8 @@ export function useTts(enabled, { onSpeakingChange, onAudibleChange } = {}) {
     buffer: "", // text not yet cut into a chunk
     raw: "", // everything the model has emitted this turn
     consumed: 0, // how much of `raw` has been cut into chunks
-    clips: [], // { rawStart, rawEnd, startAt, endAt, ends[] }
+    clips: [], // { rawStart, rawEnd, startAt, endAt, ends[], source? }
+    sources: [], // live BufferSource nodes — stopped immediately on barge-in
     nextStart: 0,
     chain: Promise.resolve(),
     gen: 0,
@@ -119,14 +120,22 @@ export function useTts(enabled, { onSpeakingChange, onAudibleChange } = {}) {
           const src = ctx.createBufferSource();
           src.buffer = decoded;
           src.connect(ctx.destination);
-          const startAt = Math.max(ctx.currentTime + 0.02, r.nextStart);
+          const startAt = Math.max(ctx.currentTime + 0.01, r.nextStart);
 
           r.playing += 1;
+          r.sources.push(src);
           src.onended = () => {
             r.playing = Math.max(0, r.playing - 1);
+            r.sources = r.sources.filter((s) => s !== src);
             sync();
           };
-          src.start(startAt);
+          try {
+            src.start(startAt);
+          } catch {
+            r.playing = Math.max(0, r.playing - 1);
+            r.sources = r.sources.filter((s) => s !== src);
+            return;
+          }
           r.nextStart = startAt + decoded.duration;
 
           r.clips.push({
@@ -225,6 +234,15 @@ export function useTts(enabled, { onSpeakingChange, onAudibleChange } = {}) {
     r.nextStart = 0;
     r.inflight = 0;
     r.playing = 0;
+    // Kill audio immediately — don't wait for buffer end / context close.
+    for (const src of r.sources) {
+      try {
+        src.stop(0);
+      } catch {
+        /* already stopped */
+      }
+    }
+    r.sources = [];
     if (r.ctx && r.ctx.state !== "closed") {
       r.ctx.close();
       r.ctx = null;

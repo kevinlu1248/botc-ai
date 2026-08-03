@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { VAD, frameFeatures, isSpeechFrame } from "./vad.js";
+import { VAD, frameFeatures, isSpeechFrame, isHardBargeIn } from "./vad.js";
 
 // Auto-gain is OFF by default. It reacts to whatever is loudest, so intermittent
 // background bangs (a door, a pool table) make it duck — which pushes quiet
@@ -343,24 +343,25 @@ export function useMic({ onFinal, onSpeechStart }) {
     [start, teardown]
   );
 
-  // While gated, watch the local (echo-cancelled) signal so the user can talk
-  // over the assistant. Deepgram's VAD can't help here — it isn't receiving
-  // audio while muted — so this is measured in the browser.
+  // While the assistant is speaking, watch the raw mic for barge-in. Deepgram
+  // is muted then, so this is the only path. Poll on a short timer (not only
+  // rAF) so a busy main thread can't delay detection by a full frame budget.
   useEffect(() => {
     if (!capturing) return;
-    let raf = 0;
     let hits = 0;
     let buf = null;
     let spectrumDb = null;
     let power = null;
+    let fired = false;
 
     const tick = () => {
-      raf = requestAnimationFrame(tick);
       const analyser = vadAnalyserRef.current;
       if (!analyser || !refs.current.playing) {
         hits = 0;
+        fired = false;
         return;
       }
+      if (fired) return; // one interrupt per playback arming
       if (!buf || buf.length !== analyser.fftSize) {
         buf = new Uint8Array(analyser.fftSize);
         spectrumDb = new Float32Array(analyser.frequencyBinCount);
@@ -368,24 +369,33 @@ export function useMic({ onFinal, onSpeechStart }) {
       }
       analyser.getByteTimeDomainData(buf);
       analyser.getFloatFrequencyData(spectrumDb);
-      // vad.js works in linear power; the analyser reports magnitude in dB.
       for (let i = 0; i < spectrumDb.length; i++) {
         power[i] = Number.isFinite(spectrumDb[i]) ? 10 ** (spectrumDb[i] / 10) : 0;
       }
 
       const features = frameFeatures(buf, power, analyser.context.sampleRate, analyser.fftSize);
+      // Hard path: one strong frame → cut immediately (~0–16ms).
+      if (isHardBargeIn(features)) {
+        hits = 0;
+        fired = true;
+        onSpeechStartRef.current?.();
+        return;
+      }
+      // Soft path: two consecutive speech-like frames.
       if (isSpeechFrame(features)) {
         if (++hits >= VAD.FRAMES) {
           hits = 0;
-          onSpeechStartRef.current?.(); // cancels playback; the gate then lifts
+          fired = true;
+          onSpeechStartRef.current?.();
         }
       } else if (hits > 0) {
-        hits--; // decay so a stray frame can't accumulate into an interrupt
+        hits = 0; // require consecutive, don't slowly decay
       }
     };
 
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
+    // ~8ms polling while armed — much snappier than rAF alone under load.
+    const id = setInterval(tick, 8);
+    return () => clearInterval(id);
   }, [capturing]);
 
   useEffect(() => () => teardown(true), [teardown]);
