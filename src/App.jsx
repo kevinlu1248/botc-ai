@@ -210,11 +210,18 @@ export default function App() {
   );
   sendRef.current = send;
 
+  // Drop pure hesitation so "um"/"uh" never become user turns (server also drops).
+  const isFillerOnly = (t) =>
+    /^(um+|uh+|er+|ah+|oh+|hmm+|mm+|mhm+|huh|like|so|well|yeah|yep|yup|nah|right|okay|ok)([.?!…,]*)$/i.test(
+      t.trim()
+    );
+
   // Voice finals are gated on looking-at-camera via the vision sidecar.
   const onVoiceFinal = useCallback(
     async (raw) => {
       const text = (raw || "").trim();
       if (!text) return;
+      if (isFillerOnly(text)) return;
       // Do not interrupt here: a rejected (not looking) transcript must not
       // kill a playing reply. Barge-in is handled by onSpeechStart while audible.
       try {

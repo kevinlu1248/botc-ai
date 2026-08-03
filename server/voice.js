@@ -60,26 +60,53 @@ const ms = (name, fallback) => {
 };
 
 // How long you may pause before the turn is considered over.
-// Defaults are snappy for voice chat; raise via env if you get cut off mid-thought.
+// Balance: too short → "um" / mid-thought cuts; too long → painful wait after done.
 // Deepgram utterance_end_ms minimum is 1000.
-const ENDPOINTING_MS = ms("STT_ENDPOINTING_MS", 450);
+const ENDPOINTING_MS = ms("STT_ENDPOINTING_MS", 650);
 const UTTERANCE_END_MS = Math.max(1000, ms("STT_UTTERANCE_END_MS", 1000));
-// Extra beat only when the transcript trails off mid-thought ("…and then").
-const CONTINUATION_GRACE_MS = ms("STT_CONTINUATION_GRACE_MS", 350);
+// Extra wait when the transcript looks incomplete ("…and then", "um", "Read").
+const CONTINUATION_GRACE_MS = ms("STT_CONTINUATION_GRACE_MS", 750);
 // Backstop when Deepgram reports no boundary at all.
-const IDLE_FLUSH_MS = ms("STT_IDLE_FLUSH_MS", 1100);
+const IDLE_FLUSH_MS = ms("STT_IDLE_FLUSH_MS", 1600);
 
 // Words that essentially never end a sentence. If speech stops right after one,
 // the speaker is pausing to think, not finished — "come up with a hard math
 // problem, and then …" should not be submitted as a complete request.
 const DANGLING_WORD =
-  /(?:^|\s)(?:and|or|but|so|then|because|since|although|though|while|whereas|if|when|whenever|where|which|who|whom|whose|that|than|with|without|within|to|too|for|from|of|off|in|into|on|onto|at|by|as|about|after|before|over|under|between|among|the|a|an|my|our|your|his|her|its|their|this|these|those|is|are|was|were|am|be|been|being|will|would|can|could|should|shall|may|might|must|do|does|did|have|has|had|also|plus|versus|vs|like|such)\s*$/i;
+  /(?:^|\s)(?:and|or|but|so|then|because|since|although|though|while|whereas|if|when|whenever|where|which|who|whom|whose|that|than|with|without|within|to|too|for|from|of|off|in|into|on|onto|at|by|as|about|after|before|over|under|between|among|the|a|an|my|our|your|his|her|its|their|this|these|those|is|are|was|were|am|be|been|being|will|would|can|could|should|shall|may|might|must|do|does|did|have|has|had|also|plus|versus|vs|like|such|um|uh|er|ah|hmm|need|let'?s|gonna|wanna|kinda|sorta)\s*$/i;
+
+// Pure hesitation / ack with no ask — never submit as a user turn.
+const FILLER_ONLY =
+  /^(um+|uh+|er+|ah+|oh+|hmm+|mm+|mhm+|huh|like|so|well|yeah|yep|yup|nah|right|okay|ok)([.?!…,]*)$/i;
+
+// Single-word openers that almost always continue ("Read …", "Need …").
+const OPENER =
+  /^(read|write|tell|give|make|say|show|get|put|do|can|could|would|will|i|we|you|the|a|an|need|let'?s|please|just|also|and|but|so)\b/i;
+
+const COMMAND =
+  /^(stop|wait|cancel|quiet|enough|pause|resume|go|yes|no|thanks|thank you)([.?!…]*)$/i;
+
+export function isCommand(text) {
+  return COMMAND.test(text.trim());
+}
+
+export function isFillerOnly(text) {
+  return FILLER_ONLY.test(text.trim());
+}
 
 export function looksUnfinished(text) {
   const t = text.trim();
   if (!t) return false;
+  if (isCommand(t)) return false; // "stop" is a complete turn
   if (/[,;:—–]$/.test(t)) return true; // trailing clause punctuation
-  return DANGLING_WORD.test(t);
+  if (DANGLING_WORD.test(t)) return true;
+  if (isFillerOnly(t)) return true; // wait — more speech usually follows "um"
+  const words = t.replace(/[.?!…,]+$/g, "").split(/\s+/).filter(Boolean);
+  // One short token is rarely a finished request ("Read", "Need").
+  if (words.length === 1 && words[0].length <= 14) return true;
+  // "Okay so" / "I need" / "let's say" without a finish.
+  if (words.length <= 4 && OPENER.test(t) && !/[.?!]$/.test(t)) return true;
+  return false;
 }
 
 // Selectable from the UI so accuracy can be A/B'd live. Benchmarked on clean
@@ -94,13 +121,16 @@ export const DEFAULT_STT_MODEL = STT_MODELS.includes(process.env.STT_MODEL || ""
   : "nova-3";
 
 // Vocabulary the recogniser should expect. Nova-3's `keyterm` prompting biases
-// decoding toward these, which is the cheapest accuracy win available for
-// jargon, product names and acronyms — no latency cost. (Nova-2 called this
-// `keywords`; the parameter name changed.) Comma-separated, optional `:boost`.
-const KEYTERMS = (process.env.STT_KEYTERMS || "")
-  .split(",")
-  .map((t) => t.trim())
-  .filter(Boolean);
+// decoding toward these. Always boost barge-in commands; env adds more.
+// (Nova-2 used `keywords`; nova-3 uses `keyterm`.) Optional `:boost` per term.
+const DEFAULT_KEYTERMS = ["stop:2", "wait:1.5", "cancel:1.5", "quiet", "enough"];
+const KEYTERMS = [
+  ...DEFAULT_KEYTERMS,
+  ...(process.env.STT_KEYTERMS || "")
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean),
+];
 
 // The browser reports the sample rate it actually got from the audio hardware —
 // requesting 16 kHz is only a hint, so don't hardcode it here.
@@ -190,18 +220,22 @@ export function attachSpeechSocket(server) {
       idleTimer = graceTimer = null;
       const text = settled.join(" ").replace(/\s+/g, " ").trim();
       settled = [];
-      if (text) {
-        if (process.env.STT_DUMP) console.log(`[stt] final: ${text}`);
-        browser.send(JSON.stringify({ type: "final", text }));
+      if (!text) return;
+      // "um" / "uh" alone are not user turns — drop them.
+      if (isFillerOnly(text) && !isCommand(text)) {
+        if (process.env.STT_DUMP) console.log(`[stt] drop filler: ${text}`);
+        return;
       }
+      if (process.env.STT_DUMP) console.log(`[stt] final: ${text}`);
+      browser.send(JSON.stringify({ type: "final", text }));
     };
 
-    // Deepgram thinks the turn ended. If the transcript trails off mid-thought,
-    // hold it briefly instead of submitting a half-finished request — resumed
-    // speech cancels the hold (see onTranscript).
+    // Deepgram thinks the turn ended. If the transcript trails off mid-thought
+    // or is a filler/opener, hold so more speech can append to `settled`.
     const endTurn = () => {
       if (!settled.length) return;
-      if (!graceTimer && looksUnfinished(settled.join(" "))) {
+      const joined = settled.join(" ");
+      if (!graceTimer && looksUnfinished(joined)) {
         graceTimer = setTimeout(flushTurn, CONTINUATION_GRACE_MS);
         return;
       }
@@ -214,7 +248,15 @@ export function attachSpeechSocket(server) {
       clearTimeout(graceTimer);
       graceTimer = null;
       clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => settled.length && flushTurn(), IDLE_FLUSH_MS);
+      idleTimer = setTimeout(() => {
+        if (!settled.length) return;
+        // Prefer grace for unfinished text even on the idle backstop.
+        if (looksUnfinished(settled.join(" "))) {
+          endTurn();
+        } else {
+          flushTurn();
+        }
+      }, IDLE_FLUSH_MS);
     };
 
     dg.on("message", (raw) => {
