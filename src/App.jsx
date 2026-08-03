@@ -348,8 +348,8 @@ export default function App() {
           <div className="transcript" ref={transcriptRef}>
             {turns.length === 0 && (
               <p className="empty">
-                Look at the camera and talk — speech is only transcribed while you&apos;re looking.
-                Type anytime to interrupt. Hard questions go to the reasoning model on the right.
+                The mic is live — look at the camera and talk, or type below. Hard questions go to
+                the reasoning model on the right.
               </p>
             )}
             {turns.map((turn, i) => {
@@ -499,27 +499,29 @@ export default function App() {
         <aside className="pane shared">
           <VisionPanel />
 
-          <h2>Shared context</h2>
+          <div className="shared-body">
+            <h2>Shared context</h2>
 
-          <div className="jobs">
-            {jobs.length === 0 && <p className="empty small">No reasoning tasks yet.</p>}
-            {jobs.map((job) => (
-              <div key={job.id} className={`job ${job.status}`}>
-                <span className="status">{job.status}</span>
-                <p>{job.question}</p>
-              </div>
-            ))}
-          </div>
+            <div className="jobs">
+              {jobs.length === 0 && <p className="empty small">No reasoning tasks yet.</p>}
+              {jobs.map((job) => (
+                <div key={job.id} className={`job ${job.status}`}>
+                  <span className="status">{job.status}</span>
+                  <p>{job.question}</p>
+                </div>
+              ))}
+            </div>
 
-          <div className="feed">
-            {feed.map((item) => (
-              <div key={item.id} className={`item ${item.source}`}>
-                <span className="kind">
-                  {item.source} · {item.jobId}
-                </span>
-                <p>{item.text}</p>
-              </div>
-            ))}
+            <div className="feed">
+              {feed.map((item) => (
+                <div key={item.id} className={`item ${item.source}`}>
+                  <span className="kind">
+                    {item.source} · {item.jobId}
+                  </span>
+                  <p>{item.text}</p>
+                </div>
+              ))}
+            </div>
           </div>
         </aside>
       </main>

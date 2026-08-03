@@ -3,8 +3,8 @@ import { useEffect, useRef, useState } from "react";
 const STATE_MS = 400;
 
 /**
- * Live room camera. Critical for lag: never pile up frame requests.
- * Only fetch the next JPEG after the previous one has loaded (or failed).
+ * Compact room strip — matches the original shared-context sidebar language.
+ * Live JPEG is pulled one-at-a-time to avoid request pile-up / lag.
  */
 export default function VisionPanel() {
   const [state, setState] = useState(null);
@@ -24,27 +24,25 @@ export default function VisionPanel() {
         if (alive.current) setState(j);
       } catch {
         if (alive.current) {
-          setState((s) => ({ ...(s || {}), running: false, error: "vision offline" }));
+          setState((s) => ({ ...(s || {}), running: false, error: "offline" }));
         }
       }
     };
 
     const pullFrame = () => {
       if (!alive.current || inflight.current) return;
-      const img = imgRef.current;
-      if (!img) return;
+      if (!imgRef.current) return;
       inflight.current = true;
       const url = `/api/vision/frame.jpg?t=${Date.now()}`;
       const probe = new Image();
       probe.onload = () => {
         if (alive.current && imgRef.current) imgRef.current.src = url;
         inflight.current = false;
-        // Immediately request the next frame — no fixed interval backlog.
         if (alive.current) requestAnimationFrame(pullFrame);
       };
       probe.onerror = () => {
         inflight.current = false;
-        if (alive.current) setTimeout(pullFrame, 200);
+        if (alive.current) setTimeout(pullFrame, 250);
       };
       probe.src = url;
     };
@@ -60,74 +58,53 @@ export default function VisionPanel() {
   }, []);
 
   const people = state?.people || [];
-  const looking = (state?.looking || []).length;
+  const present = people.filter((p) => p.present);
+  const looking = present.filter((p) => p.looking).length;
   const live = Boolean(state?.running);
 
   return (
-    <div className="vision-panel">
-      <div className="vision-head">
-        <h2>Room</h2>
-        <span className={`vision-status ${live ? "on" : "off"}`}>
-          {live ? `● ${state.fps || 0} fps · looking ${looking}` : "○ offline"}
+    <div className="vision-card">
+      <div className="vision-card-head">
+        <span className="vision-kicker">Room</span>
+        <span className={`vision-dot ${live ? "on" : "off"}`}>
+          {live
+            ? `${state.fps || 0} fps${looking ? ` · ${looking} looking` : ""}`
+            : state?.error || "offline"}
         </span>
       </div>
 
-      <div className="vision-frame-wrap">
+      <div className={`vision-preview ${live ? "" : "empty"}`}>
         <img
           ref={imgRef}
           className="vision-frame"
-          alt="Live room camera"
-          style={{ display: live ? "block" : "none" }}
+          alt=""
+          style={{ visibility: live ? "visible" : "hidden" }}
         />
-        {!live && (
-          <div className="vision-placeholder">
-            {state?.error || "Start the vision server (npm run vision)"}
-          </div>
-        )}
+        {!live && <span>{state?.error || "camera offline"}</span>}
       </div>
 
-      <h3 className="vision-sub">People this session</h3>
-      <div className="vision-people">
-        {people.length === 0 && (
-          <p className="empty small">No one identified yet — face the camera.</p>
-        )}
-        {people.map((p) => {
-          const initial = (p.label || p.pid || "?").trim().slice(0, 1).toUpperCase();
-          return (
-            <div
-              key={p.pid}
-              className={`vision-person ${p.present ? "here" : ""} ${p.looking ? "looking" : ""}`}
-            >
-              {p.photo ? (
-                <img className="vision-face" src={p.photo} alt="" />
-              ) : (
-                <div className="vision-face placeholder">{initial}</div>
-              )}
-              <div className="vision-meta">
-                <div className="vision-name">{p.label || p.pid}</div>
-                <div className="vision-id">
-                  {p.pid}
-                  {p.looking_score != null && p.present
-                    ? ` · look ${Number(p.looking_score).toFixed(2)}`
-                    : ""}
-                </div>
-              </div>
-              <div className="vision-badges">
-                <span className="vbadge">{p.present ? "in room" : "away"}</span>
-                {p.present && (
-                  <span className={`vbadge ${p.looking ? "look" : ""}`}>
-                    {p.looking ? "looking" : "not looking"}
-                  </span>
+      {people.length > 0 && (
+        <div className="vision-roster" title="People seen this session">
+          {people.map((p) => {
+            const initial = (p.label || p.pid || "?").trim().slice(0, 1).toUpperCase();
+            return (
+              <div
+                key={p.pid}
+                className={`vision-chip ${p.present ? "here" : ""} ${p.looking ? "looking" : ""}`}
+                title={`${p.label || p.pid}${p.looking ? " · looking" : p.present ? " · in room" : " · away"}`}
+              >
+                {p.photo ? (
+                  <img src={p.photo} alt="" />
+                ) : (
+                  <span className="vision-initial">{initial}</span>
                 )}
+                <span className="vision-chip-name">{p.label || p.pid}</span>
+                {p.looking && <span className="vision-chip-mark" />}
               </div>
-            </div>
-          );
-        })}
-      </div>
-      <p className="vision-hint">
-        Speech is only transcribed when someone is looking at the camera. Attribution is
-        vision-based (who is looking), not audio diarization. Any text interrupts the assistant.
-      </p>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
