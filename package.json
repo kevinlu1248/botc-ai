@@ -5,10 +5,13 @@
   "type": "module",
   "scripts": {
     "server": "node server/index.js",
-    "dev": "vite --port 5181",
+    "dev": "vite --port 5181 --host 127.0.0.1 --strictPort",
     "vision": "vision/.venv/bin/python vision/server.py",
-    "start": "node server/index.js & vite --port 5181",
-    "start:all": "vision/.venv/bin/python vision/server.py & node server/index.js & vite --port 5181"
+    "up": "bash scripts/keepup.sh start",
+    "down": "bash scripts/keepup.sh stop",
+    "status": "bash scripts/keepup.sh status",
+    "start": "bash scripts/keepup.sh start",
+    "start:all": "bash scripts/keepup.sh start"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.115.0",
