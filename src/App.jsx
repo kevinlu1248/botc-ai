@@ -3,17 +3,25 @@ import { useMic } from "./useMic.js";
 import { useTts } from "./useTts.js";
 import MicMeter from "./MicMeter.jsx";
 import Toasts from "./Toasts.jsx";
+import Settings from "./Settings.jsx";
+import { reportError } from "./report.js";
 import VisionPanel from "./VisionPanel.jsx";
 
 const TOAST_MS = 7000;
+// How long a queued utterance stays relevant. Past this it refers to a turn that
+// has already finished or been interrupted.
+const QUEUE_TTL_MS = 3500;
 
 // "claude-opus-5" -> "Opus 5"; "claude-haiku-4-5" -> "Haiku 4.5"
 function shortModel(id) {
   if (!id) return "…";
-  const m = id.match(/^claude-([a-z]+)-([\d-]+?)(?:-\d{8})?$/);
-  if (!m) return id;
-  const name = m[1][0].toUpperCase() + m[1].slice(1);
-  return `${name} ${m[2].replace(/-/g, ".")}`;
+  const cap = (w) => w[0].toUpperCase() + w.slice(1);
+  const claude = id.match(/^claude-([a-z]+)-([\d-]+?)(?:-\d{8})?$/);
+  if (claude) return `${cap(claude[1])} ${claude[2].replace(/-/g, ".")}`;
+  // gemini-3.6-flash -> "Gemini 3.6 Flash"
+  const gemini = id.match(/^gemini-([\d.]+)-([a-z]+)$/);
+  if (gemini) return `Gemini ${gemini[1]} ${cap(gemini[2])}`;
+  return id;
 }
 
 export default function App() {
@@ -28,9 +36,13 @@ export default function App() {
   const [feed, setFeed] = useState([]);
   const [typed, setTyped] = useState("");
   const [toasts, setToasts] = useState([]); // { id, text, kind }
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [meta, setMeta] = useState(null); // { models, voice, stt } from the server
 
-  const tts = useTts(voiceOut, { onSpeakingChange: setSpeaking, onAudibleChange: setAudible });
+  const tts = useTts(voiceOut, {
+    onSpeakingChange: setSpeaking,
+    onAudibleChange: setAudible,
+  });
   const busyRef = useRef(false);
   // Utterances that arrive while a turn is in flight. Without this they were
   // silently discarded: anything said while the model was thinking was lost.
@@ -51,6 +63,9 @@ export default function App() {
   const pushToast = useCallback(
     (text, kind = "error") => {
       const id = ++toastId.current;
+      // Anything shown to the user as an error is also worth having in the server
+      // log — that is how the extended-thinking 400 stayed invisible.
+      if (kind === "error") reportError(text, { kind: "toast" });
       setToasts((t) => {
         if (t.some((x) => x.text === text)) return t; // don't stack duplicates
         return [...t, { id, text, kind }];
@@ -66,6 +81,9 @@ export default function App() {
   const interrupt = useCallback(() => {
     if (!streamLiveRef.current) return; // already cut this stream
     streamLiveRef.current = false;
+    // Whatever was queued was said before this interruption, so it no longer
+    // describes what the user wants.
+    queueRef.current.length = 0;
 
     const cut = tts.stopTurn();
     setInterrupted(true);
@@ -180,6 +198,16 @@ export default function App() {
                 };
                 return next;
               });
+            } else if (msg.type === "no_response") {
+              // The model explicitly declined. Never spoken; shown as a badge so a
+              // deliberate silence is distinguishable from a dropped reply.
+              setTurns((t) => {
+                const next = [...t];
+                const last = next[next.length - 1];
+                if (last?.cutOff) return t;
+                next[next.length - 1] = { ...last, declined: true };
+                return next;
+              });
             } else if (msg.type === "job_started") {
               setJobs((j) => [...j, { ...msg.job, status: "running" }]);
             } else if (msg.type === "error") {
@@ -218,17 +246,34 @@ export default function App() {
 
   // Voice finals are gated on looking-at-camera via the vision sidecar.
   const onVoiceFinal = useCallback(
-    async (raw) => {
+    async (raw, meta) => {
       const text = (raw || "").trim();
       if (!text) return;
       if (isFillerOnly(text)) return;
+
+      // No client-side swallowing of "stop" and friends. The model sees everything
+      // the user says and decides for itself whether to answer, replying with the
+      // NO_RESPONSE sentinel when it declines (see fastSystem in server/agents.js).
+      // An earlier version dropped stop-like utterances here, which meant the model
+      // never learned it had been told to stop — and the pattern only matched a
+      // single word, so "Stop. Stop." was answered out loud anyway.
+      //
       // Do not interrupt here: a rejected (not looking) transcript must not
       // kill a playing reply. Barge-in is handled by onSpeechStart while audible.
       try {
         const res = await fetch("/api/vision/gate", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ text }),
+          // `profile` matters as much as `speaker`: diarization indices are
+          // unreliable on short utterances (a TV line landed in the user's own
+          // cluster), so the acoustic profile is the load-bearing check. It was
+          // being dropped here while useMic computed it, which meant the entire
+          // acoustic gate silently never ran.
+          body: JSON.stringify({
+            text,
+            speaker: meta?.speaker ?? null,
+            profile: meta?.profile ?? null,
+          }),
         });
         const gate = await res.json();
         if (!gate.ok) {
@@ -237,12 +282,17 @@ export default function App() {
           }
           return;
         }
+        // Another voice is no longer discarded — it enters the transcript labelled as
+        // a different speaker so the model has the context and can judge for itself
+        // whether it was addressed.
         const who = gate.display?.who || "Someone";
+        const attributed = gate.display?.attributed !== false;
         send(gate.text, {
           modelText: gate.text,
-          displayText: `${who} (looking): ${gate.display?.said || text}`,
+          displayText: `${who}${attributed ? " (looking)" : ""}: ${gate.display?.said || text}`,
           who,
-          looking: true,
+          looking: attributed,
+          otherVoice: !attributed,
         });
       } catch {
         // Vision offline — fall back to un-gated text so the app still works.
@@ -342,11 +392,19 @@ export default function App() {
           BOTC AI
         </div>
         <div className="models">
-          <span className="tag fast">{shortModel(meta?.models?.fast)} · voice</span>
+          <span className="tag fast">{shortModel(meta?.models?.fast)} · chat</span>
           <span className="tag slow">
             {shortModel(meta?.models?.slow)} · reasoning
             {running > 0 && <em>{running} running</em>}
           </span>
+          <button
+            className="gear"
+            onClick={() => setSettingsOpen(true)}
+            title="Models, voice & microphone"
+            aria-label="Settings"
+          >
+            ⚙
+          </button>
         </div>
       </header>
 
@@ -366,12 +424,13 @@ export default function App() {
                 isLast &&
                 spokenChars != null &&
                 spokenChars < turn.text.length;
+              // `declined` is the model saying so explicitly; the no-text-but-thought
+              // case is kept for turns that predate the sentinel.
               const silent =
                 turn.role === "assistant" &&
-                !turn.text?.trim() &&
-                !!turn.thought &&
-                !(busy && isLast) &&
-                !turn.cutOff;
+                !turn.cutOff &&
+                (turn.declined ||
+                  (!turn.text?.trim() && !!turn.thought && !(busy && isLast)));
               return (
                 <div key={i} className={`turn ${turn.role}${silent ? " silent-turn" : ""}`}>
                   <span className="who">
@@ -380,6 +439,9 @@ export default function App() {
                         ? `${turn.who}${turn.looking ? " · looking" : ""}`
                         : "You"
                       : "Assistant"}
+                    {/* Handled as a control action, so no reply follows — say so,
+                        or an unanswered turn reads as the app having hung. */}
+                    {turn.control && <span className="control-tag">stopped playback</span>}
                   </span>
                   {turn.thought && (
                     <div className="thought-block">
@@ -428,36 +490,7 @@ export default function App() {
               status={busy ? "thinking" : speaking ? "speaking" : null}
             />
 
-            {meta?.stt?.models?.length > 1 && (
-              <select
-                className="device"
-                value={mic.sttModel || meta.stt.current}
-                onChange={(e) => mic.selectSttModel(e.target.value)}
-                title="Speech-recognition model — nova-3 benchmarks best; the others are for comparison"
-              >
-                {meta.stt.models.map((m) => (
-                  <option key={m} value={m}>
-                    {m}
-                  </option>
-                ))}
-              </select>
-            )}
 
-            <select
-              className="device"
-              value={mic.deviceId}
-              onChange={(e) => mic.selectDevice(e.target.value)}
-              title={`Microphone: ${
-                mic.devices.find((d) => d.deviceId === mic.deviceId)?.label || "system default"
-              }`}
-            >
-              <option value="">Default mic</option>
-              {mic.devices.map((d, i) => (
-                <option key={d.deviceId || i} value={d.deviceId}>
-                  {d.label || `Input ${i + 1}`}
-                </option>
-              ))}
-            </select>
           </div>
 
           <div className="composer">
@@ -532,6 +565,17 @@ export default function App() {
           </div>
         </aside>
       </main>
+
+      <Settings
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        vadBackend={mic.vadBackend}
+        devices={mic.devices}
+        deviceId={mic.deviceId}
+        onDeviceChange={(id) => mic.selectDevice(id)}
+        // The Deepgram model is fixed per connection, so this reconnects the mic.
+        onSttChange={(model) => mic.selectSttModel(model)}
+      />
 
       <Toasts items={toasts} onDismiss={dismissToast} />
     </div>

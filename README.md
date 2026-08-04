@@ -139,6 +139,37 @@ Default voices work — Sarah (`EXAVITQu4vr4xnSDxMaL`), George (`JBFqnCBsd6RMkjV
 
 ---
 
+---
+
+## Models
+
+Everything this app runs on, local and hosted. Sizes are the actual files on disk.
+
+### Local (downloaded, run on your machine)
+
+| Model | Size | Purpose | Source |
+| --- | --- | --- | --- |
+| **Silero VAD v5** (`silero_vad.onnx`) | 2.2 MB | Speech/no-speech detection for barge-in **and turn end**. Replaced hand-tuned spectral heuristics; hard-fails rather than falling back. | [snakers4/silero-vad](https://github.com/snakers4/silero-vad) · [HF](https://huggingface.co/onnx-community/silero-vad) |
+| **YuNet** (`face_detection_yunet_2023mar.onnx`) | 0.2 MB | Face detection for the looking gate. | [opencv/opencv_zoo](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet) · [HF](https://huggingface.co/opencv/face_detection_yunet) |
+| **SFace** (`face_recognition_sface_2021dec.onnx`) | 36.9 MB | Face recognition — keeps "Person 1" stable across frames. | [opencv/opencv_zoo](https://github.com/opencv/opencv_zoo/tree/main/models/face_recognition_sface) · [HF](https://huggingface.co/opencv/face_recognition_sface) |
+| **YOLO11n-pose** (`yolo11n-pose.pt`) | ~6 MB (fetched on first run) | Body/pose keypoints — presence, and raised hands (not yet wired to chat). | [Ultralytics](https://docs.ultralytics.com/models/yolo11/) · [HF](https://huggingface.co/Ultralytics/YOLO11) |
+| **ECAPA-TDNN** (`spkrec-ecapa-voxceleb`) | ~80 MB (not downloaded) | Voice embeddings for true speaker verification. **Vendored but disabled** — see *Voice binding*. | [HF](https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb) |
+| **onnxruntime-web** (wasm runtime) | 12.9 MB | Runs Silero in the browser. CPU-only build; the default entry pulls a 26 MB WebGPU wasm instead. | [microsoft/onnxruntime](https://github.com/microsoft/onnxruntime) |
+
+First page load fetches roughly 15 MB (Silero + wasm runtime), ~3.6 MB gzipped, then caches.
+
+### Hosted (API)
+
+| Model | Purpose |
+| --- | --- |
+| **Claude Sonnet 5** | Fast conversational model — spoken replies, private reasoning, tool call to the slow model |
+| **Gemini 3.6 / 3.5 Flash** | Alternative conversational model, selectable in the settings modal (`GEMINI_API_KEY`). No readable thought summaries — Gemini returns a thought *signature* only |
+| **Claude Opus 5** | Background deep reasoning (Fable 5 preferred; needs 30-day retention) |
+| **Deepgram Nova-3** | Streaming speech-to-text. nova-2 / enhanced / base selectable in the UI for comparison |
+| **ElevenLabs Flash v2.5** | Streaming text-to-speech with character-level timestamps |
+
+---
+
 ## Voice pipeline
 
 ### Speech to text
@@ -155,10 +186,10 @@ passes that to Deepgram, so a mismatch can't silently produce garbage transcript
 
 | Variable | Default | Role |
 | --- | --- | --- |
-| `STT_ENDPOINTING_MS` | 1000 | Silence before Deepgram ends the utterance |
+| `STT_ENDPOINTING_MS` | 650 | Silence before Deepgram ends the utterance |
 | `STT_UTTERANCE_END_MS` | 1000 | Fallback boundary (Deepgram minimum is 1000) |
-| `STT_CONTINUATION_GRACE_MS` | 900 | Extra wait when speech trails off mid-thought |
-| `STT_IDLE_FLUSH_MS` | 2500 | Backstop when no boundary is reported at all |
+| `STT_CONTINUATION_GRACE_MS` | 750 | Extra wait when speech trails off mid-thought |
+| `STT_IDLE_FLUSH_MS` | 1600 | Backstop when no boundary is reported at all |
 
 Three things are worth knowing here:
 
@@ -230,8 +261,54 @@ The slow model gets the opposite instruction — it must **always** produce a co
 part of the live conversation and an empty turn throws the work away.
 
 Because thinking shares the token budget with the reply, `max_tokens` is 4096 rather than 2048.
-Thinking blocks are passed back to the API unchanged (they're part of `msg.content`, which is pushed
-to history wholesale), and the truncation rewrite preserves them along with `tool_use` blocks.
+
+### History hygiene (why `messagesForClaude` exists)
+
+`shared.history` is stored in Anthropic message shape, but it is **not** a valid payload for whichever
+model happens to be selected right now. Two things make it invalid:
+
+- **Thinking signatures are bound to the model that produced them.** The settings modal makes
+  switching the conversation model mid-conversation normal (Sonnet → Gemini → Sonnet), which replays
+  one model's thinking blocks to another.
+- **Gemini turns carry no thinking blocks at all**, and `thoughtSignature` cannot be stored on the
+  block (Anthropic rejects unknown fields: `tool_use.thoughtSignature: Extra inputs are not permitted`).
+
+So `messagesForClaude(model)` rebuilds the payload per request. Which model produced a message is
+tracked in a `WeakMap` beside the history — never on the message, for the reason above.
+
+The rules it applies were **measured against the API**, not assumed (`scripts/thinking-*.mjs`):
+
+| Payload | Result |
+|---|---|
+| thinking blocks on non-final assistant messages | ignored — safe to drop |
+| assistant turn with `tool_use` and no thinking block | accepted |
+| thinking block with a corrupted `signature` | `400 Invalid signature in thinking block` |
+| thinking block with `signature` field removed | `400 thinking.signature: Field required` |
+| summarized thinking whose *text* was edited, signature kept | **accepted** — text is not integrity-checked |
+| `display: "summarized"`, blocks reordered / swapped between turns | accepted |
+
+That last group is the surprise: with `display: "summarized"` neither Sonnet 5 nor Opus 5 enforces
+block integrity, so the reported
+`` `thinking` … blocks in the latest assistant message cannot be modified `` is **not** reachable by
+editing summarized blocks. It comes from the stricter **raw** thinking path — which is why
+`runReasoningJob` now sets `display: "summarized"` explicitly instead of omitting it. That call also
+uses `fallbacks: "default"`, so a declined request is answered by a *substitute model* and the blocks
+in its history no longer match the model named in the next request.
+
+Both loops therefore **retry once with thinking stripped** when the API rejects a payload shape. Before
+this, one stale block killed every following turn and the only fix was restarting the server — the
+reported failure showed the same error twice in a row for exactly that reason. Repairs are logged
+loudly (`[history] …`) rather than passed over in silence.
+
+`scripts/test-history-sanitizer.mjs` covers all of it end to end (10 assertions against the live API),
+and `scripts/repro-matrix.mjs` drives the running server through interrupts, overlapping turns,
+double interrupts, Haiku, and a model-switch storm — each on a freshly restarted server, since history
+is in memory and a stale one makes a pass meaningless.
+
+Not every model accepts the voice path's tuning: **`claude-haiku-4-5` rejects both** adaptive thinking
+(*"adaptive thinking is not supported on this model"*) and `output_config.effort` (*"This model does not
+support the effort parameter."*), one error at a time. It is in the dropdown, so `fastRequest` omits
+both for it; selecting Haiku used to fail every single turn.
 
 ### Interruption
 
@@ -294,6 +371,71 @@ and hearing stay in step while you can still read ahead. On interruption the dim
 disappears, showing exactly what went unsaid. Driven by a 20 Hz poll of the audio clock rather than
 per-frame, since it only needs to update text.
 
+### Barge-in has exactly one authority
+
+`src/bargein.js` is the only place allowed to decide that the user is talking over
+the assistant. This is enforced structurally because the alternative already failed:
+the decision was being made in **two** places, and the weaker one won.
+
+- `src/silero.js` — a trained speech/no-speech model over the raw mic tap.
+- Deepgram `vad_events` → `speech_started`, which called `fireInterrupt()` directly
+  from the WebSocket handler with no corroboration.
+
+The second is energy-based, and it fired on a knuckle-tap on the laptop, a door, a
+siren. Because it bypassed Silero completely, **every Silero threshold was irrelevant
+to the false interrupts users actually hit** — the reported "the VAD is overly
+sensitive" was not the VAD being consulted at all.
+
+Measured on a real captured session (`scripts/analyse-recording.mjs`, tapping on the
+laptop while the assistant spoke):
+
+| | |
+|---|---|
+| loud-but-not-speech buckets (the taps) | **124**, RMS up to 0.365 |
+| Silero's score on them | **0.00–0.03** |
+| actual speech buckets | 2 |
+
+Silero rejected every tap correctly, yet the assistant was cut off — which is how you
+know the interrupt came from the other detector. Synthetic sirens, clicks and typing
+also score 0.01–0.05 (`scripts/vad-bargein.mjs`), so the model was never the problem.
+
+**One authority only works if it can hear.** Removing the energy detector exposed the
+other half of the bug: Silero was tapping `source` (the **raw** mic) while Deepgram got
+`tail` (the conditioned chain — highpass, compressor, 4× makeup gain, limiter). The raw
+mic is un-amplified *and* ducked by browser echo cancellation while TTS plays, so
+barge-in was impossible during playback — the user said "stop" four times and the tap
+measured **0.0003 RMS, p=0.00** while Deepgram transcribed it fine. That silent failure
+is why an energy detector had been bolted on in the first place.
+
+Silero now taps `tail`. Measured on the captured session, conditioned stream:
+
+| | |
+|---|---|
+| user speech (incl. the failed "stop") | **p=0.73–1.00**, 4–16 speech frames/bucket → fires |
+| 364 loud transients | **p=0.00** at RMS up to 0.36 → ignored |
+| assistant's own TTS during playback | no speech buckets at all → no self-interrupt |
+
+Amplification does not fool a trained classifier the way it fools an energy threshold.
+That is the property that makes a single detector viable, and it is why the raw-tap
+comment ("thresholds are calibrated against unprocessed levels") stopped applying the
+moment the hand-tuned heuristics were replaced by a model.
+
+Rules that follow, and the reasons they are rules rather than good intentions:
+
+- **New signals go through `consider()`.** Never call the interrupt from a message
+  handler. `speech_started` is now logged as `bargein-ignored` and acted on by nothing.
+- **Deepgram's VAD is still fine for end-of-turn**, where it cannot cut anyone off.
+- **`vad.js` is profiling only.** `isHardBargeIn` was deleted — it had no callers, and
+  leaving a plausible-looking "should I interrupt?" helper beside the real detector is
+  exactly how two authorities appeared. Its thresholds must not be re-tuned for
+  interruption behaviour.
+- **The harness imports the shipped constant** (`BARGE_IN.MIN_FRAMES`) instead of
+  redeclaring it, so it can never certify a threshold the app isn't using.
+- **Every barge-in reports why it fired** — the last 8 frames of probability and RMS,
+  to the server log as `[client:bargein]`. A false trigger otherwise leaves no trace:
+  it happens in the browser, from audio nobody kept, and the complaint arrives minutes
+  later. `STT_DUMP=1` keeps the matching audio in `recordings/`.
+
 ### Level meter
 
 A proper **mel-scale spectrum**, not ad-hoc binning. `src/mel.js` builds a triangular mel filterbank:
@@ -338,6 +480,46 @@ live. Set `VITE_MIC_CONDITIONING=false` to bypass the chain entirely.
 Two analyser taps exist for a reason: the **meter** reads the conditioned signal (what you see is what
 is sent), while **barge-in** reads the raw mic, because `src/vad.js` thresholds are calibrated against
 unprocessed levels and would false-fire on amplified background.
+
+### Voice binding (whose voice is it?)
+
+**The load-bearing test is acoustic, not diarization.** Deepgram's speaker indices proved unreliable
+on the short utterances this app sees — they frequently never arrived at all. So each utterance gets a
+cheap physical profile instead (`src/profile.js`, computed in the browser over the raw mic tap):
+
+| Feature | Why it separates a person from a speaker |
+| --- | --- |
+| `lowRatio` | Share of energy in 80–300 Hz, where a human fundamental lives. A phone speaker physically cannot reproduce it. **The decisive one.** |
+| `rmsStd` | Dynamic range. Broadcast and game audio is loudness-compressed and sits flat; a live voice swells and drops. |
+| `centroidMean` | Spectral brightness — small speakers are tinny. |
+| `flatness` | Tonal versus noise-like. |
+
+The first looking-gated utterance enrolls; later ones are compared with a weighted, scale-normalised
+distance (`profileDistance`) and rejected past `VOICE_PROFILE_MAX_DIST` (default 2.2). Measured: a
+phone-like profile lands at **4.3**, real speech at **0**.
+
+Two subtleties that were bugs first. The profile **must** be taken from the raw tap — the conditioning
+chain compresses dynamics and band-limits, destroying exactly `rmsStd` and `lowRatio`. And the
+reference is only reinforced by *clearly* matching voices (distance under half the threshold);
+merging anything merely accepted lets a borderline foreign voice drag the reference toward itself
+until it matches. If the wrong voice enrolls first, `POST /api/voice/reset` re-learns. Every decision
+is logged as `[voice] dist=…` so the threshold can be tuned from real usage.
+
+
+
+Deepgram runs with `diarize=true`, so every word carries a speaker index. Diarization separates voices
+but has no idea which one is *you*, so the index is bound to the looking gate: the **first index heard
+while someone is looking at the camera** becomes the speaker, and other voices are rejected with
+`reason: "other_voice"`. That is what stops a video playing on a phone from being treated as a turn.
+
+Indices are only meaningful within one Deepgram connection, so the binding resets whenever `/ws/stt`
+reconnects. Inspect it at `/api/state → stt.voice`. `VOICE_BIND=false` keeps the labels but accepts
+every voice; `STT_DIARIZE=false` turns labels off entirely.
+
+This is the cheap version. Clustering is unreliable on 1–2 second utterances, and the binding is lost
+on reconnect. True speaker *verification* is the robust answer and is mostly vendored already — see
+`vision/botcirl-src/botcirl/voices.py` and `identity.py`, plus `calibrate_voice.py`, which derives the
+decision threshold from your own room instead of guessing it.
 
 ### Transcription accuracy
 

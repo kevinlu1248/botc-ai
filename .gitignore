@@ -11,3 +11,6 @@ vision/botcirl-src/**/__pycache__/
 *.pyc
 .venv/
 .run/
+
+# build output
+dist/

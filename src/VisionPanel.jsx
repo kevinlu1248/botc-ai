@@ -11,6 +11,36 @@ export default function VisionPanel() {
   const imgRef = useRef(null);
   const inflight = useRef(false);
   const alive = useRef(true);
+  // pid being renamed, and the in-progress text. The sidecar's own labels are just
+  // "Person 1"/"Person 2" in first-seen order, so a real name is far more useful —
+  // it flows into the model's [Speaker] line as well as this strip.
+  const [editing, setEditing] = useState(null);
+  const [draft, setDraft] = useState("");
+
+  const saveName = async (pid) => {
+    const name = draft.trim();
+    setEditing(null);
+    try {
+      await fetch(`/api/vision/people/${encodeURIComponent(pid)}/name`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+      // Reflect immediately; the poll would otherwise take a beat to catch up.
+      setState((s) =>
+        s
+          ? {
+              ...s,
+              people: (s.people || []).map((p) =>
+                p.pid === pid ? { ...p, label: name || p.pid } : p
+              ),
+            }
+          : s
+      );
+    } catch {
+      /* the next poll will show whatever actually stuck */
+    }
+  };
 
   useEffect(() => {
     alive.current = true;
@@ -98,7 +128,31 @@ export default function VisionPanel() {
                 ) : (
                   <span className="vision-initial">{initial}</span>
                 )}
-                <span className="vision-chip-name">{p.label || p.pid}</span>
+                {editing === p.pid ? (
+                  <input
+                    className="vision-chip-input"
+                    autoFocus
+                    value={draft}
+                    placeholder={p.pid}
+                    onChange={(e) => setDraft(e.target.value)}
+                    onBlur={() => saveName(p.pid)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") saveName(p.pid);
+                      if (e.key === "Escape") setEditing(null);
+                    }}
+                  />
+                ) : (
+                  <span
+                    className="vision-chip-name"
+                    title="Click to rename"
+                    onClick={() => {
+                      setDraft(p.label === p.pid ? "" : p.label || "");
+                      setEditing(p.pid);
+                    }}
+                  >
+                    {p.label || p.pid}
+                  </span>
+                )}
                 {p.looking && <span className="vision-chip-mark" />}
               </div>
             );

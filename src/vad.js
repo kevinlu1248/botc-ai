@@ -1,9 +1,14 @@
-// Frame-level "is this speech?" test, used to decide whether the user is talking
-// over the assistant.
+// Frame-level spectral features, used **only** to decide which frames are worth
+// feeding into the per-utterance acoustic profile (see profile.js).
 //
-// Loudness alone can't answer that: a door slam, a keyboard, or music is loud
-// too. Two cheap spectral features separate speech from noise well enough for a
-// barge-in gate, and both come free from the AnalyserNode we already run.
+// This is NOT the barge-in detector. Barge-in is Silero, via src/bargein.js, and
+// it has exactly one authority — see the comment at the top of that file for why
+// that rule is now structural. The hand-tuned thresholds below are kept because
+// profiling uses `isProfileFrame`, but they no longer decide anything the user can
+// feel, so do not re-tune them for interruption behaviour.
+//
+// Two cheap spectral features separate speech from noise, and both come free from
+// the AnalyserNode we already run.
 //
 //   speechRatio — fraction of power inside 300–3400 Hz (the band voices occupy).
 //                 Slams and desk thumps put most of their energy below that;
@@ -24,18 +29,26 @@
 export const VAD = {
   // Soft path: one consecutive speech-like frame is enough.
   RMS_MIN: 0.028,
+  // Level floor for profiling only — see isProfileFrame for the measurements.
+  PROFILE_RMS_MIN: 0.006,
   SPEECH_RATIO_MIN: 0.28,
-  FLATNESS_MAX: 0.55,
+  FLATNESS_MAX: 0.48, // was 0.55: hair/clothing noise sits just under that
   DOMINANCE_MAX: 0.8,
-  FRAMES: 1,
+  FRAMES: 1, // kept for reference; the loop confirms by duration (MIN_MS) instead
+  // Poll windows overlap heavily (6ms interval, 128ms FFT), so counting frames is
+  // a weak time filter. Requiring qualifying audio to persist for a real duration
+  // rejects clicks and taps while staying far below perceptible latency.
+  MIN_MS: 90,
   // Hard path: loud energy → interrupt on the first sample (AEC can dull speech
   // features, so pure loudness still counts while the assistant is talking).
   HARD_RMS: 0.04,
-  HARD_SPEECH_RATIO: 0.25,
-  HARD_FLATNESS_MAX: 0.6,
+  HARD_SPEECH_RATIO: 0.45, // was 0.25: noise measures 28-41%, speech 61-98%
+  HARD_FLATNESS_MAX: 0.35, // was 0.6: noise measures 0.54-0.58, voiced speech 0.002-0.04
   // Ultra path: just loud — user said "stop" four times because spectral gates
   // rejected near-field speech under echo cancellation.
   LOUD_RMS: 0.07,
+  LOUD_FLATNESS_MAX: 0.35, // reject broadband noise: scratching, inhaling, taps
+  LOUD_SPEECH_RATIO: 0.3, // and require the energy to be in the voice band
 };
 
 const SPEECH_LO = 300;
@@ -92,12 +105,34 @@ export function isSpeechFrame({ rms, speechRatio, flatness, dominance }) {
   );
 }
 
-/** Instant barge-in: loud energy and/or speech-like spectrum. */
-export function isHardBargeIn({ rms, speechRatio, flatness }) {
-  if (rms >= VAD.LOUD_RMS) return true; // just yell / "STOP"
+/**
+ * Frame selector for acoustic *profiling*, which needs a much lower level floor
+ * than the old barge-in test it used to share.
+ *
+ * Measured on the raw tap, which is what profiling reads (levels are pre-makeup-gain
+ * and browser echo cancellation ducks it further):
+ *   user speech   10 of 100 frames cleared 0.028, peak 0.0446
+ *   user "Stop."   0 of 104 frames cleared 0.028, peak 0.0186
+ *   a TV playing   0 of 449 frames cleared 0.028, peak 0.0107
+ * So at RMS_MIN the profiler never reached the 25 frames it needs and every single
+ * utterance was gated with no profile at all. The spectral tests are kept — they are
+ * what reject non-speech — and only the level floor is lowered.
+ *
+ * The floor deliberately admits the TV too: a voice must be *characterised* before
+ * it can be rejected, and the discrimination is profileDistance's job, not the
+ * floor's.
+ */
+export function isProfileFrame({ rms, speechRatio, flatness, dominance }) {
   return (
-    rms >= VAD.HARD_RMS &&
-    speechRatio >= VAD.HARD_SPEECH_RATIO &&
-    flatness <= VAD.HARD_FLATNESS_MAX
+    rms >= VAD.PROFILE_RMS_MIN &&
+    speechRatio >= VAD.SPEECH_RATIO_MIN &&
+    flatness <= VAD.FLATNESS_MAX &&
+    dominance <= VAD.DOMINANCE_MAX
   );
 }
+
+// `isHardBargeIn` used to live here — a loudness-first interrupt test. It is gone
+// on purpose. It had no callers left, and keeping a plausible-looking
+// "should I interrupt?" helper next to the real detector is how this subsystem
+// ended up with two competing authorities in the first place. Interruption logic
+// belongs in src/bargein.js, and nowhere else.

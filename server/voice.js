@@ -1,6 +1,8 @@
 import { WebSocketServer, WebSocket } from "ws";
 import fs from "node:fs";
 import path from "node:path";
+import { resetVoiceBinding } from "./vision.js";
+import { getSettings } from "./settings.js";
 
 // Writes a playable WAV rather than headerless PCM, so dumps can be opened in
 // Finder / QuickTime directly. The data length isn't known until the stream ends,
@@ -62,10 +64,10 @@ const ms = (name, fallback) => {
 // How long you may pause before the turn is considered over.
 // Balance: too short → "um" / mid-thought cuts; too long → painful wait after done.
 // Deepgram utterance_end_ms minimum is 1000.
-const ENDPOINTING_MS = ms("STT_ENDPOINTING_MS", 650);
+const ENDPOINTING_MS = ms("STT_ENDPOINTING_MS", 1100);
 const UTTERANCE_END_MS = Math.max(1000, ms("STT_UTTERANCE_END_MS", 1000));
 // Extra wait when the transcript looks incomplete ("…and then", "um", "Read").
-const CONTINUATION_GRACE_MS = ms("STT_CONTINUATION_GRACE_MS", 750);
+const CONTINUATION_GRACE_MS = ms("STT_CONTINUATION_GRACE_MS", 450);
 // Backstop when Deepgram reports no boundary at all.
 const IDLE_FLUSH_MS = ms("STT_IDLE_FLUSH_MS", 1600);
 
@@ -116,9 +118,8 @@ export function looksUnfinished(text) {
 // effectively perfect there. If nova-3 is transcribing badly, the audio is the
 // problem, not the model.
 export const STT_MODELS = ["nova-3", "nova-2", "enhanced", "base"];
-export const DEFAULT_STT_MODEL = STT_MODELS.includes(process.env.STT_MODEL || "")
-  ? process.env.STT_MODEL
-  : "nova-3";
+// Kept as a named export for /api/state; the live value comes from settings.
+export const DEFAULT_STT_MODEL = getSettings().stt;
 
 // Vocabulary the recogniser should expect. Nova-3's `keyterm` prompting biases
 // decoding toward these. Always boost barge-in commands; env adds more.
@@ -144,6 +145,10 @@ function deepgramParams(sampleRate, model) {
     smart_format: "true",
     punctuate: "true",
     vad_events: "true", // SpeechStarted, used for barge-in
+    // Per-word speaker labels. Deepgram clusters voices but has no idea which
+    // one is the user, so the index is bound to whoever is looking at the camera
+    // (server/vision.js). Indices are per-connection and reset on reconnect.
+    diarize: String(process.env.STT_DIARIZE !== "false"),
     endpointing: String(ENDPOINTING_MS),
     // speech_final is not guaranteed to fire on continuous speech, so
     // UtteranceEnd is the reliable turn boundary. Minimum accepted is 1000.
@@ -159,6 +164,8 @@ export function attachSpeechSocket(server) {
   const wss = new WebSocketServer({ server, path: "/ws/stt" });
 
   wss.on("connection", (browser, req) => {
+    // Diarization indices are only meaningful within one Deepgram connection.
+    resetVoiceBinding();
     const key = process.env.DEEPGRAM_API_KEY;
     if (!key) {
       browser.send(
@@ -177,7 +184,7 @@ export function attachSpeechSocket(server) {
       ? Math.round(requested)
       : 16000;
     const wanted = query.get("model");
-    const model = STT_MODELS.includes(wanted) ? wanted : DEFAULT_STT_MODEL;
+    const model = STT_MODELS.includes(wanted) ? wanted : getSettings().stt;
 
     // STT_DUMP=1 writes the exact PCM sent upstream to disk. This is the only
     // way to answer "is the audio bad or is the recogniser wrong?" — re-transcribe
@@ -211,6 +218,9 @@ export function attachSpeechSocket(server) {
     // may span several, so segments are accumulated and flushed on a turn
     // boundary: `speech_final` when it fires, otherwise `UtteranceEnd`.
     let settled = [];
+    // Turn-level speaker tally. A turn spans several is_final segments, so the
+    // reported speaker is whichever index owns the most words in it.
+    let speakerWords = new Map();
     let idleTimer = null;
     let graceTimer = null;
 
@@ -220,14 +230,28 @@ export function attachSpeechSocket(server) {
       idleTimer = graceTimer = null;
       const text = settled.join(" ").replace(/\s+/g, " ").trim();
       settled = [];
+      let speaker = null;
+      let topWords = 0;
+      for (const [idx, count] of speakerWords) {
+        if (count > topWords) {
+          topWords = count;
+          speaker = idx;
+        }
+      }
+      speakerWords = new Map();
       if (!text) return;
       // "um" / "uh" alone are not user turns — drop them.
       if (isFillerOnly(text) && !isCommand(text)) {
         if (process.env.STT_DUMP) console.log(`[stt] drop filler: ${text}`);
         return;
       }
-      if (process.env.STT_DUMP) console.log(`[stt] final: ${text}`);
-      browser.send(JSON.stringify({ type: "final", text }));
+      if (process.env.STT_DUMP) console.log(`[stt] speaker=${speaker} final: ${text}`);
+      // `speaker` has to actually reach the client: it is forwarded to
+      // /api/vision/gate, which skips voice binding entirely when it is null. It was
+      // tallied and logged here but never sent, so the `[stt] speaker=N` line made
+      // diarization look wired up while every gate decision saw null and let other
+      // voices (a TV, a phone) through as if they were the bound speaker.
+      browser.send(JSON.stringify({ type: "final", text, speaker }));
     };
 
     // Deepgram thinks the turn ended. If the transcript trails off mid-thought
@@ -272,6 +296,10 @@ export function attachSpeechSocket(server) {
         if (transcript) onTranscript();
         if (msg.is_final) {
           if (transcript) settled.push(transcript);
+          for (const w of msg.channel?.alternatives?.[0]?.words || []) {
+            if (w.speaker === undefined) continue;
+            speakerWords.set(w.speaker, (speakerWords.get(w.speaker) || 0) + 1);
+          }
           if (msg.speech_final) endTurn();
           else if (settled.length) {
             browser.send(JSON.stringify({ type: "partial", text: settled.join(" ") }));
@@ -320,6 +348,12 @@ export function attachSpeechSocket(server) {
       }
       if (control?.type === "finish" && dg.readyState === WebSocket.OPEN) {
         dg.send(JSON.stringify({ type: "CloseStream" }));
+      } else if (control?.type === "finalize" && dg.readyState === WebSocket.OPEN) {
+        // The client's local VAD heard the user stop. Force Deepgram to finalize
+        // buffered audio now instead of waiting out `endpointing` — that is what
+        // made turn ends feel like a multi-second pause. Deepgram's own Finalize
+        // message exists for exactly this.
+        dg.send(JSON.stringify({ type: "Finalize" }));
       }
     });
 
@@ -340,9 +374,6 @@ export function attachSpeechSocket(server) {
 // Text-to-speech: ElevenLabs Flash v2.5, streamed straight through to the browser.
 // ---------------------------------------------------------------------------
 
-// Sarah, one of ElevenLabs' default voices. Library voices (Rachel, Aria, …)
-// return 402 on the free tier, so don't default to one.
-const VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "EXAVITQu4vr4xnSDxMaL";
 
 export function registerTtsRoute(app) {
   app.post("/api/tts", async (req, res) => {
@@ -359,14 +390,14 @@ export function registerTtsRoute(app) {
       // They're what lets the client know exactly how far playback got when the
       // user interrupts.
       const upstream = await fetch(
-        `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}/stream/with-timestamps` +
+        `https://api.elevenlabs.io/v1/text-to-speech/${getSettings().voice}/stream/with-timestamps` +
           `?output_format=mp3_44100_128`,
         {
           method: "POST",
           headers: { "xi-api-key": key, "content-type": "application/json" },
           body: JSON.stringify({
             text,
-            model_id: "eleven_flash_v2_5", // lowest-latency ElevenLabs model
+            model_id: getSettings().tts,
             voice_settings: { stability: 0.4, similarity_boost: 0.75, speed: 1.05 },
           }),
         }

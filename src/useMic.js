@@ -1,5 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { VAD, frameFeatures, isSpeechFrame, isHardBargeIn } from "./vad.js";
+import { VAD, frameFeatures, isProfileFrame } from "./vad.js";
+import { createProfiler } from "./profile.js";
+import { createSileroVad, SILERO } from "./silero.js";
+import { createBargeInGate } from "./bargein.js";
+import { reportEvent } from "./report.js";
+
+// Once Silero has heard silence for this long after speech, the turn is over. The
+// client says so explicitly (Deepgram `Finalize`) instead of waiting out
+// server-side `endpointing`, which is what made turn ends feel like a long pause.
+const VAD_END_MS = 480;
 
 // Auto-gain is OFF by default. It reacts to whatever is loudest, so intermittent
 // background bangs (a door, a pool table) make it duck — which pushes quiet
@@ -23,17 +32,28 @@ const AUDIO_HINTS = {
   autoGainControl: { ideal: flag("VITE_MIC_AGC", false) },
 };
 
-// Barge-in while the assistant is speaking. Deepgram's own VAD can't be trusted
-// here — it's hearing the playback too — so this is measured locally, after the
-// browser's echo canceller, and classified as speech-or-not by src/vad.js.
-// Loudness alone used to be the test, which meant a door slam or keyboard
-// clatter would "interrupt" the assistant.
+// Barge-in runs on Silero VAD over the raw tap (see silero.js). Deepgram's own
+// VAD can't be trusted during playback — it hears the playback too.
 
 // Makeup gain applied after compression. 4x suits a laptop mic at arm's length;
 // lower it for a headset, where the raw level is already healthy.
 const MIC_GAIN = Number(import.meta.env?.VITE_MIC_GAIN) || 4;
 // Set VITE_MIC_CONDITIONING=false to send the raw mic instead, for comparison.
 const CONDITIONING = flag("VITE_MIC_CONDITIONING", true);
+
+// A final that lands while the gate is shut is usually TTS echo — but it can also
+// be the front half of an interruption, because the server completes command
+// words ("stop") immediately as their own turn. Discarding it outright loses the
+// "stop" from "stop here". So hold it briefly, and keep it only if a real barge-in
+// follows: that is what distinguishes the user's voice from our own playback.
+const HELD_STITCH_MS = 2500; // max age to prepend onto the next final
+const HELD_ALONE_MS = 1200; // deliver held text alone if nothing follows
+
+// Acoustic profiling is per-utterance, not per-session. A gap this long between
+// qualifying frames means a new source is talking, and the cap stops one long
+// stretch of background audio from dominating the average even without a gap.
+const PROFILE_GAP_MS = 1200;
+const PROFILE_MAX_FRAMES = 200; // ~5s of qualifying frames at the 25ms poll
 
 async function openStream(deviceId) {
   const attempts = [
@@ -67,6 +87,7 @@ export function useMic({ onFinal, onSpeechStart }) {
   const [devices, setDevices] = useState([]);
   const [deviceId, setDeviceId] = useState(""); // "" = system default
   const [sttModel, setSttModel] = useState(""); // "" = whatever the server defaults to
+  const [vadBackend, setVadBackend] = useState("loading"); // silero once loaded
 
   const refs = useRef({
     ws: null,
@@ -76,17 +97,73 @@ export function useMic({ onFinal, onSpeechStart }) {
     source: null,
     chain: null,
     muted: false,
-    playing: false, // assistant audio is actually coming out of the speakers
+    playing: false,
+    held: null, // { text, at } captured while gated
+    profiler: null, // per-utterance acoustic profile (raw mic)
+    vad: null, // Silero session; null until loaded, or if loading failed
+    vadNode: null, // raw-tap worklet feeding it
+    vadBusy: false, // inference in flight — drop frames rather than queue
+    bargeIn: createBargeInGate(), // sole authority for interrupting the assistant
+    vadSpeaking: false,
+    vadSpokeAt: 0, // last frame that contained speech
+    vadFinalized: true, // already asked Deepgram to finalize this turn
+    heldTimer: null,
+    interruptedAt: 0, // assistant audio is actually coming out of the speakers
   });
   // Read directly by the visualizer's animation loop (conditioned signal).
   const analyserRef = useRef(null);
-  // Raw mic, for barge-in classification (see vad.js threshold calibration).
+  // Raw mic, for acoustic profiling — pre-compression, because the dynamics that
+  // separate a person from a loudspeaker are exactly what the compressor flattens.
   const vadAnalyserRef = useRef(null);
 
   const onFinalRef = useRef(onFinal);
   onFinalRef.current = onFinal;
   const onSpeechStartRef = useRef(onSpeechStart);
   onSpeechStartRef.current = onSpeechStart;
+
+  // Every barge-in path goes through here so the timestamp is always recorded —
+  // held text is only trusted when a real interruption backs it up.
+  const fireInterrupt = useCallback(() => {
+    refs.current.interruptedAt = Date.now();
+    onSpeechStartRef.current?.();
+  }, []);
+
+  // Deliver a final, stitching on anything held from behind the gate.
+  const deliverFinal = useCallback((text, speaker) => {
+    const r = refs.current;
+    clearTimeout(r.heldTimer);
+    r.heldTimer = null;
+
+    let out = (text || "").trim();
+    const held = r.held;
+    r.held = null;
+    if (held) {
+      const fresh = Date.now() - held.at < HELD_STITCH_MS;
+      // Slack: the VAD needs ~150ms of speech to confirm, so the interrupt is
+      // stamped slightly *after* the words that triggered it were finalized.
+      const backedByInterrupt = r.interruptedAt >= held.at - 1000;
+      if (fresh && backedByInterrupt && held.text && !out.startsWith(held.text)) {
+        out = `${held.text} ${out}`.replace(/\s+/g, " ").trim();
+        // The held half carries the speaker label when the tail didn't.
+        if (speaker === null || speaker === undefined) speaker = held.speaker;
+      }
+    }
+    const profile = r.profiler?.take() ?? null;
+    if (out) {
+      // Makes a starved profiler visible instead of it looking like silence.
+      const stats = r.profStats;
+      reportEvent("profile", {
+        speaker: speaker ?? null,
+        profileFrames: profile?.frames ?? 0,
+        qualifyingFrames: stats?.ok ?? 0,
+        framesSeen: stats?.seen ?? 0,
+        maxRawRms: Number((stats?.maxRms ?? 0).toFixed(4)),
+        rmsFloor: VAD.PROFILE_RMS_MIN,
+      });
+      r.profStats = { seen: 0, ok: 0, maxRms: 0 };
+      onFinalRef.current?.(out, { speaker: speaker ?? null, profile });
+    }
+  }, []);
 
   // The mic is never closed or silenced — audio always flows upstream, so
   // nothing is clipped when you start talking over the assistant. What this
@@ -155,6 +232,17 @@ export function useMic({ onFinal, onSpeechStart }) {
       }
     }
 
+    clearTimeout(r.heldTimer);
+    r.heldTimer = null;
+    r.held = null;
+    r.vadNode?.disconnect();
+    r.vadNode = null;
+    r.bargeIn.reset();
+    r.vadSpeaking = false;
+    r.vadSpokeAt = 0;
+    r.vadFinalized = true;
+    r.profiler = null;
+
     setPartial("");
     setCapturing(false);
     setState("idle");
@@ -202,14 +290,48 @@ export function useMic({ onFinal, onSpeechStart }) {
             setPartial(gated ? "" : msg.text);
           } else if (msg.type === "final") {
             setPartial("");
-            if (!gated && msg.text.trim()) onFinalRef.current?.(msg.text.trim());
+            const text = (msg.text || "").trim();
+            if (!text) {
+              // nothing to do
+            } else if (gated) {
+              // Hold it: this may be the leading words of an interruption.
+              const r = refs.current;
+              r.held = {
+                text: r.held ? `${r.held.text} ${text}` : text,
+                speaker: msg.speaker ?? r.held?.speaker ?? null,
+                at: Date.now(),
+              };
+              clearTimeout(r.heldTimer);
+              // If the user interrupted and then said nothing more, the held
+              // words *were* the whole utterance — deliver them rather than
+              // silently dropping. If no interrupt backed them, they were echo.
+              r.heldTimer = setTimeout(() => {
+                const h = refs.current.held;
+                refs.current.held = null;
+                if (h && refs.current.interruptedAt >= h.at - 1000) {
+                  onFinalRef.current?.(h.text, {
+                    speaker: h.speaker ?? null,
+                    profile: refs.current.profiler?.take() ?? null,
+                  });
+                }
+              }, HELD_ALONE_MS);
+            } else {
+              deliverFinal(text, msg.speaker ?? null);
+            }
           } else if (msg.type === "speech_started") {
-            // Barge-in while the assistant is armed (TTS fetching or playing).
-            // Audio still streams to Deepgram while "muted" — muted only drops
-            // partials/finals so TTS isn't transcribed. speech_started must
-            // still fire when muted, or "stop" never cuts the assistant.
+            // Deliberately does NOT interrupt. This is Deepgram's energy-based VAD:
+            // it fires on a tap on the laptop, a door, a siren. It used to call
+            // fireInterrupt() directly, which bypassed Silero completely and was
+            // the real cause of the "overly sensitive VAD" false barge-ins —
+            // Silero scores those same transients at 0.01-0.05.
+            //
+            // Barge-in has one authority now (src/bargein.js). Logged, not acted on,
+            // so the value of this signal stays visible.
             if (refs.current.playing) {
-              onSpeechStartRef.current?.();
+              reportEvent("bargein-ignored", {
+                source: "deepgram-vad",
+                trail: refs.current.bargeIn?.trail() ?? [],
+              });
             }
           } else if (msg.type === "ready") {
             setState("live");
@@ -286,9 +408,9 @@ export function useMic({ onFinal, onSpeechStart }) {
         tail.connect(analyser);
         analyserRef.current = analyser;
 
-        // Barge-in taps the *raw* mic instead: src/vad.js thresholds are
-        // calibrated against unprocessed levels, and reading them off the
-        // compressed signal would fire on amplified background.
+        // Acoustic *profiling* taps the raw mic: speaker identity should be measured
+        // before compression flattens the dynamics it keys on. This is no longer a
+        // barge-in tap — vad.js is profiling-only (see its header).
         const vadAnalyser = ctx.createAnalyser();
         vadAnalyser.fftSize = 2048;
         vadAnalyser.smoothingTimeConstant = 0.5;
@@ -308,14 +430,106 @@ export function useMic({ onFinal, onSpeechStart }) {
         mute.gain.value = 0;
         node.connect(mute).connect(ctx.destination);
         refs.current.node = node;
+        refs.current.profiler = createProfiler();
+
+        // --- Silero VAD on the raw tap ---
+        // Deliberately NOT fault-tolerant. An earlier version caught load failures
+        // and quietly fell back to the spectral heuristics, which meant a broken
+        // wasm path degraded barge-in for an unknown length of time with nothing
+        // but a console warning. If the model cannot load, the mic fails loudly.
+        {
+          await ctx.audioWorklet.addModule("/vad-worklet.js");
+          const vadNode = new AudioWorkletNode(ctx, "vad-worklet", {
+            processorOptions: { frameSize: 512 },
+          });
+          // Feed Silero the CONDITIONED signal — the same audio Deepgram gets.
+          //
+          // This was `source` (raw), which made barge-in impossible during playback:
+          // the raw mic is un-amplified and browser echo cancellation ducks it while
+          // TTS plays, so the tap measured 0.0003 RMS / p=0.00 while the user was
+          // saying "stop" clearly enough for Deepgram to transcribe it. That silent
+          // failure is why a second, energy-based detector had been bolted on.
+          //
+          // Measured on a real captured session (scripts/analyse-recording.mjs over
+          // the conditioned stream that STT_DUMP records):
+          //   user speech          p=0.73-1.00, 4-16 speech frames per bucket -> fires
+          //   364 loud transients  p=0.00 even at RMS 0.36                    -> ignored
+          //   assistant's own TTS  no speech buckets at all                   -> no self-interrupt
+          // Amplification does not fool a trained classifier the way it fools an
+          // energy threshold, which is the whole reason this can be one detector.
+          tail.connect(vadNode);
+          const vadMute = ctx.createGain();
+          vadMute.gain.value = 0;
+          vadNode.connect(vadMute).connect(ctx.destination);
+          refs.current.vadNode = vadNode;
+
+          const vad = refs.current.vad ?? (await createSileroVad());
+          refs.current.vad = vad;
+          vad.reset();
+          setVadBackend("silero");
+
+          vadNode.port.onmessage = async (event) => {
+            const r = refs.current;
+            if (!r.vad || r.vadBusy) return; // never queue: stale frames are worse
+            r.vadBusy = true;
+            try {
+              const prob = await r.vad.process(event.data);
+              let sum = 0;
+              for (let i = 0; i < event.data.length; i++) sum += event.data[i] * event.data[i];
+              const frameRms = Math.sqrt(sum / event.data.length);
+
+              // Hysteresis, so a wavering score can't flap mid-syllable.
+              r.vadSpeaking = r.vadSpeaking
+                ? prob >= SILERO.EXIT
+                : prob >= SILERO.ENTER;
+
+              // End-of-turn: local silence after speech finalizes immediately.
+              const now = performance.now();
+              if (r.vadSpeaking) {
+                r.vadSpokeAt = now;
+                r.vadFinalized = false;
+              } else if (
+                !r.vadFinalized &&
+                r.vadSpokeAt &&
+                now - r.vadSpokeAt >= VAD_END_MS &&
+                !r.muted
+              ) {
+                r.vadFinalized = true;
+                if (r.ws?.readyState === WebSocket.OPEN) {
+                  r.ws.send(JSON.stringify({ type: "finalize" }));
+                }
+              }
+
+              // The single barge-in authority. Every frame goes in; the gate
+              // decides, so there is one place to reason about and one place to log.
+              const hit = r.bargeIn.consider({
+                speaking: r.vadSpeaking,
+                prob,
+                rms: frameRms,
+                armed: r.playing,
+              });
+              if (hit) {
+                reportEvent("bargein", hit);
+                fireInterrupt();
+              }
+            } finally {
+              r.vadBusy = false;
+            }
+          };
+        }
+
         setCapturing(true);
       } catch (err) {
-        setError(err?.name === "NotAllowedError" ? "Microphone permission denied." : String(err?.message || err));
+        setError(
+          err?.name === "NotAllowedError"
+            ? "Microphone permission denied."
+            : `Mic failed to start: ${err?.message || err}`
+        );
         setState("error");
         teardown(true);
       }
     },
-    [deviceId, sttModel, refreshDevices, setMuted, teardown]
+    [deviceId, sttModel, refreshDevices, setMuted, teardown, deliverFinal, fireInterrupt]
   );
 
   // Switching device mid-session needs a hard restart of the audio graph.
@@ -343,25 +557,21 @@ export function useMic({ onFinal, onSpeechStart }) {
     [start, teardown]
   );
 
-  // While the assistant is speaking, watch the raw mic for barge-in. Deepgram
-  // is muted then, so this is the only path. Poll on a short timer (not only
-  // rAF) so a busy main thread can't delay detection by a full frame budget.
+  // Builds the per-utterance speaker profile from the RAW mic (see profile.js):
+  // the conditioning chain compresses dynamics and band-limits, destroying the
+  // very features that distinguish a person from a phone speaker. Skipped while
+  // the assistant is audible so its own voice never enters the profile.
   useEffect(() => {
     if (!capturing) return;
-    let hits = 0;
     let buf = null;
     let spectrumDb = null;
     let power = null;
-    let fired = false;
 
     const tick = () => {
       const analyser = vadAnalyserRef.current;
-      if (!analyser || !refs.current.playing) {
-        hits = 0;
-        fired = false;
-        return;
-      }
-      if (fired) return; // one interrupt per playback arming
+      if (!analyser) return;
+      // Only profile while nothing is playing, so our own TTS never contaminates it.
+      if (refs.current.playing) return;
       if (!buf || buf.length !== analyser.fftSize) {
         buf = new Uint8Array(analyser.fftSize);
         spectrumDb = new Float32Array(analyser.frequencyBinCount);
@@ -374,27 +584,41 @@ export function useMic({ onFinal, onSpeechStart }) {
       }
 
       const features = frameFeatures(buf, power, analyser.context.sampleRate, analyser.fftSize);
-      // Hard / loud path: cut immediately.
-      if (isHardBargeIn(features)) {
-        hits = 0;
-        fired = true;
-        onSpeechStartRef.current?.();
-        return;
-      }
-      // Soft path: speech-like frames (default 1).
-      if (isSpeechFrame(features)) {
-        if (++hits >= VAD.FRAMES) {
-          hits = 0;
-          fired = true;
-          onSpeechStartRef.current?.();
+
+      // Why this is measured: the profiler needs 25 qualifying frames before
+      // take() returns anything, and it qualifies frames off the RAW tap against
+      // VAD.RMS_MIN. The raw mic is quiet on this hardware, so "profile is null"
+      // and "the user did not speak" look identical without these counters.
+      const stats = (refs.current.profStats ??= { seen: 0, ok: 0, maxRms: 0 });
+      stats.seen++;
+      stats.maxRms = Math.max(stats.maxRms, features.rms);
+
+      if (isProfileFrame(features)) {
+        // Keep the profile about the CURRENT utterance. take() used to be the only
+        // reset, so everything heard since the last final was averaged together —
+        // measured 895 profile frames drawn from 30,359 polls (~12 minutes), which
+        // blended a TV playing in the room into "the user's" voice and collapsed the
+        // distance between them (TV 1.68 vs user 1.19-1.70: no separation at all).
+        const now = performance.now();
+        const gap = now - (refs.current.profLastAt || 0);
+        if (refs.current.profLastAt && (gap > PROFILE_GAP_MS || stats.ok >= PROFILE_MAX_FRAMES)) {
+          refs.current.profiler?.reset();
+          stats.ok = 0;
         }
-      } else {
-        hits = 0;
+        refs.current.profLastAt = now;
+        stats.ok++;
+        refs.current.profiler?.push(
+          features.rms,
+          power,
+          analyser.context.sampleRate,
+          analyser.fftSize
+        );
       }
     };
 
-    // ~6ms while armed.
-    const id = setInterval(tick, 6);
+    // 25ms is ample: this only accumulates a per-utterance average, and barge-in
+    // (which did need a tight loop) now runs off the Silero worklet instead.
+    const id = setInterval(tick, 25);
     return () => clearInterval(id);
   }, [capturing]);
 
@@ -409,6 +633,7 @@ export function useMic({ onFinal, onSpeechStart }) {
     devices,
     deviceId,
     sttModel,
+    vadBackend,
     analyserRef,
     start,
     stop,
